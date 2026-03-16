@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -53,10 +55,58 @@ class PrependAudioSilence:
         return (out_audio,)
 
 
+class LTXFramesFromAudio:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "fps": (
+                    "FLOAT",
+                    {
+                        "default": 24.0,
+                        "min": 1.0,
+                        "max": 120.0,
+                        "step": 0.01,
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "FLOAT")
+    RETURN_NAMES = ("frames", "duration_seconds")
+    FUNCTION = "calculate"
+    CATEGORY = "audio"
+
+    def calculate(self, audio, fps):
+        waveform = audio.get("waveform")
+        sample_rate = int(audio.get("sample_rate", 0))
+
+        if waveform is None or sample_rate <= 0:
+            raise ValueError("Invalid AUDIO input. Expected waveform and sample_rate.")
+
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(0)
+
+        if waveform.dim() != 3:
+            raise ValueError("Unsupported waveform shape. Expected [batch, channels, samples].")
+
+        duration_seconds = float(waveform.shape[-1]) / float(sample_rate)
+        raw_frames = duration_seconds * float(fps)
+
+        # LTX expects frame counts that satisfy 4n + 1.
+        frames = int(4 * math.ceil(max(0.0, (raw_frames - 1.0) / 4.0)) + 1)
+        frames = max(1, frames)
+
+        return (frames, duration_seconds)
+
+
 NODE_CLASS_MAPPINGS = {
     "PrependAudioSilence": PrependAudioSilence,
+    "LTXFramesFromAudio": LTXFramesFromAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PrependAudioSilence": "Prepend Audio Silence",
+    "LTXFramesFromAudio": "LTX Frames From Audio",
 }

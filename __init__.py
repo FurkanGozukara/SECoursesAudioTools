@@ -2,6 +2,13 @@ import math
 
 import torch
 
+from .video_outpaint import (
+    VideoOutpaintPrepareCanvasByPadding,
+    VideoOutpaintRegionCrop,
+    VideoOutpaintRegionCropAdvanced,
+    VideoOutpaintReplicateCanvas,
+)
+
 
 class PrependAudioSilence:
     @classmethod
@@ -104,9 +111,17 @@ class LTXFramesFromAudio:
 NODE_CLASS_MAPPINGS = {
     "PrependAudioSilence": PrependAudioSilence,
     "LTXFramesFromAudio": LTXFramesFromAudio,
+    "VideoOutpaintPrepareCanvasByPadding": VideoOutpaintPrepareCanvasByPadding,
+    "VideoOutpaintReplicateCanvas": VideoOutpaintReplicateCanvas,
+    "VideoOutpaintRegionCrop": VideoOutpaintRegionCrop,
+    "VideoOutpaintRegionCropAdvanced": VideoOutpaintRegionCropAdvanced,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PrependAudioSilence": "Prepend Audio Silence",
     "LTXFramesFromAudio": "LTX Frames From Audio",
+    "VideoOutpaintPrepareCanvasByPadding": "Video Outpaint Prepare Canvas By Padding",
+    "VideoOutpaintReplicateCanvas": "Video Outpaint Replicate Canvas",
+    "VideoOutpaintRegionCrop": "Video Outpaint Region Crop",
+    "VideoOutpaintRegionCropAdvanced": "Video Outpaint Region Crop Advanced",
 }

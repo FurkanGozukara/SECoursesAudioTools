@@ -1,4 +1,6 @@
+import gc
 import math
+import os
 
 import torch
 
@@ -8,6 +10,45 @@ from .video_outpaint import (
     VideoOutpaintRegionCropAdvanced,
     VideoOutpaintReplicateCanvas,
 )
+
+
+class SEAnyType(str):
+    def __ne__(self, __value):
+        return False
+
+
+SE_ANY = SEAnyType("*")
+VIDEO_EXTENSIONS = {"webm", "mp4", "mkv", "gif", "mov", "avi", "m4v"}
+
+
+def _input_videos():
+    import folder_paths
+
+    input_dir = folder_paths.get_input_directory()
+    try:
+        files = [
+            f
+            for f in os.listdir(input_dir)
+            if os.path.isfile(os.path.join(input_dir, f))
+            and f.split(".")[-1].lower() in VIDEO_EXTENSIONS
+        ]
+        return sorted(files)
+    except FileNotFoundError:
+        return []
+
+
+def _fraction_to_float(value, fallback=0.0):
+    if value is None:
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _padded_ltx_frame_count(frame_count):
+    frame_count = max(1, int(frame_count))
+    return int(1 + math.ceil((frame_count - 1) / 8) * 8)
 
 
 class PrependAudioSilence:
@@ -129,10 +170,411 @@ class SEOptionalMetaBatch:
         return (meta_batch if enabled else None,)
 
 
+class SEMetaBatchBypassGate:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "enabled": ("BOOLEAN",),
+            },
+            "optional": {
+                "meta_batch": ("VHS_BatchManager",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "passthrough"
+    CATEGORY = "video"
+
+    def passthrough(self, image, enabled, meta_batch=None):
+        if meta_batch is not None and not enabled:
+            meta_batch.close_inputs()
+            meta_batch.has_closed_inputs = True
+        return (image,)
+
+
+class SEAutoStreamingChunkSeconds:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "fps_override": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1000.0,
+                        "step": 0.01,
+                    },
+                ),
+                "requested_chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 100000.0,
+                        "step": 0.001,
+                    },
+                ),
+                "reencode_chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 3.0,
+                        "min": 0.1,
+                        "max": 100000.0,
+                        "step": 0.1,
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("effective_chunk_seconds",)
+    FUNCTION = "resolve"
+    CATEGORY = "video"
+
+    def resolve(self, fps_override, requested_chunk_seconds, reencode_chunk_seconds):
+        requested = float(requested_chunk_seconds)
+        print(
+            "[SECoursesAudioTools] streaming chunk resolver: "
+            f"fps_override={float(fps_override):g}, requested={requested:g}, effective={requested:g}"
+        )
+        return (requested,)
+
+
+class SEMemoryFlushImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "empty_cache": ("BOOLEAN", {"default": True}),
+                "gc_collect": ("BOOLEAN", {"default": True}),
+                "unload_all_models": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "dependency_1": (SE_ANY,),
+                "dependency_2": (SE_ANY,),
+                "dependency_3": (SE_ANY,),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "flush"
+    CATEGORY = "video"
+
+    def flush(
+        self,
+        image,
+        empty_cache=True,
+        gc_collect=True,
+        unload_all_models=True,
+        dependency_1=None,
+        dependency_2=None,
+        dependency_3=None,
+    ):
+        before = ""
+        if torch.cuda.is_available():
+            before = (
+                f" cuda_alloc={torch.cuda.memory_allocated() / 1024**3:.2f}GB"
+                f" cuda_reserved={torch.cuda.memory_reserved() / 1024**3:.2f}GB"
+            )
+        print("[SECoursesAudioTools] memory flush before LTX load:" + before)
+
+        dependency_1 = None
+        dependency_2 = None
+        dependency_3 = None
+
+        if unload_all_models:
+            import comfy.model_management
+
+            comfy.model_management.unload_all_models()
+        if gc_collect:
+            gc.collect()
+        if empty_cache:
+            import comfy.model_management
+
+            comfy.model_management.soft_empty_cache()
+        after = ""
+        if torch.cuda.is_available():
+            after = (
+                f" cuda_alloc={torch.cuda.memory_allocated() / 1024**3:.2f}GB"
+                f" cuda_reserved={torch.cuda.memory_reserved() / 1024**3:.2f}GB"
+            )
+        print("[SECoursesAudioTools] memory flush after LTX load gate:" + after)
+        return (image,)
+
+
+class SELowVRAMAudioVAELoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+
+        return {
+            "required": {
+                "ckpt_name": (
+                    folder_paths.get_filename_list("checkpoints"),
+                    {"tooltip": "Audio VAE checkpoint to load."},
+                ),
+            },
+            "optional": {
+                "dependencies": (
+                    SE_ANY,
+                    {"tooltip": "Connect any previous stage output to force sequential loading."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("VAE",)
+    RETURN_NAMES = ("audio_vae",)
+    FUNCTION = "load_audio_vae"
+    CATEGORY = "audio"
+
+    def load_audio_vae(self, ckpt_name, dependencies=None):
+        import comfy.sd
+        import comfy.utils
+        import folder_paths
+
+        ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        sd, metadata = comfy.utils.load_torch_file(ckpt_path, return_metadata=True)
+        sd = comfy.utils.state_dict_prefix_replace(
+            sd,
+            {"audio_vae.": "autoencoder.", "vocoder.": "vocoder."},
+            filter_keys=True,
+        )
+        vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+        vae.throw_exception_if_invalid()
+        return (vae,)
+
+
+class SELoadVideoWithPath:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": (_input_videos(),),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "video_name", "video_path")
+    FUNCTION = "load"
+    CATEGORY = "video"
+
+    def load(self, video):
+        import folder_paths
+        from comfy_api.latest import InputImpl
+
+        video_path = folder_paths.get_annotated_filepath(video)
+        return (InputImpl.VideoFromFile(video_path), video, video_path)
+
+    @classmethod
+    def IS_CHANGED(cls, video):
+        import folder_paths
+
+        video_path = folder_paths.get_annotated_filepath(video)
+        return os.path.getmtime(video_path)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, video):
+        import folder_paths
+
+        if not folder_paths.exists_annotated_filepath(video):
+            return f"Invalid video file: {video}"
+        return True
+
+
+class SEVideoPathFromVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_path",)
+    FUNCTION = "get_path"
+    CATEGORY = "video"
+
+    def get_path(self, video):
+        if not hasattr(video, "get_stream_source"):
+            raise ValueError("VIDEO input does not expose a stream source.")
+        source = video.get_stream_source()
+        if not isinstance(source, str):
+            raise ValueError("VIDEO source is not a file path; streaming path mode requires a file-backed video.")
+        if not os.path.isfile(source):
+            raise ValueError(f"VIDEO source path does not exist: {source}")
+        return (source,)
+
+    @classmethod
+    def IS_CHANGED(cls, video):
+        if not hasattr(video, "get_stream_source"):
+            return float("nan")
+        source = video.get_stream_source()
+        if not isinstance(source, str) or not os.path.isfile(source):
+            return float("nan")
+        return os.path.getmtime(source)
+
+
+class SEVideoStreamingInfoPath:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_path": ("STRING", {"default": ""}),
+                "fps_override": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1000.0,
+                        "step": 0.01,
+                    },
+                ),
+                "source_duration_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 100000.0,
+                        "step": 0.001,
+                    },
+                ),
+                "streaming_chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 10.0,
+                        "min": 0.0,
+                        "max": 100000.0,
+                        "step": 0.001,
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = (
+        "FLOAT",
+        "FLOAT",
+        "INT",
+        "FLOAT",
+        "INT",
+        "INT",
+        "INT",
+        "INT",
+        "FLOAT",
+    )
+    RETURN_NAMES = (
+        "resolved_fps",
+        "source_fps",
+        "effective_frame_count",
+        "effective_duration",
+        "source_width",
+        "source_height",
+        "frame_load_cap",
+        "frames_per_batch",
+        "source_duration",
+    )
+    FUNCTION = "get_info"
+    CATEGORY = "video"
+
+    def get_info(
+        self,
+        video_path,
+        fps_override=0.0,
+        source_duration_seconds=0.0,
+        streaming_chunk_seconds=10.0,
+    ):
+        import av
+
+        video_path = str(video_path).strip().strip('"')
+        if not video_path or not os.path.isfile(video_path):
+            raise ValueError(f"Invalid video_path: {video_path}")
+
+        with av.open(video_path, mode="r") as container:
+            video_stream = next((s for s in container.streams if s.type == "video"), None)
+            if video_stream is None:
+                raise ValueError(f"No video stream found in {video_path}")
+
+            source_fps = _fraction_to_float(video_stream.average_rate, 0.0)
+            if source_fps <= 0:
+                source_fps = 1.0
+
+            if video_stream.duration is not None and video_stream.time_base is not None:
+                source_duration = float(video_stream.duration * video_stream.time_base)
+            elif container.duration is not None:
+                source_duration = float(container.duration / av.time_base)
+            elif video_stream.frames:
+                source_duration = float(video_stream.frames / source_fps)
+            else:
+                raise ValueError(f"Could not determine duration for {video_path}")
+
+            source_width = int(video_stream.width)
+            source_height = int(video_stream.height)
+            source_frame_count = int(video_stream.frames or round(source_duration * source_fps))
+
+        resolved_fps = float(fps_override) if float(fps_override) > 0 else source_fps
+        duration_limit = float(source_duration_seconds)
+        if duration_limit > 0:
+            effective_duration = min(duration_limit, source_duration)
+            frame_load_cap = max(1, int(round(effective_duration * resolved_fps)))
+        else:
+            effective_duration = source_duration
+            frame_load_cap = 0
+
+        if frame_load_cap > 0:
+            effective_frame_count = frame_load_cap
+        elif float(fps_override) > 0:
+            effective_frame_count = max(1, int(round(effective_duration * resolved_fps)))
+        else:
+            effective_frame_count = max(1, source_frame_count)
+
+        if float(streaming_chunk_seconds) > 0:
+            raw_chunk_frames = max(1, int(round(float(streaming_chunk_seconds) * resolved_fps)))
+            frames_per_batch = min(
+                effective_frame_count,
+                _padded_ltx_frame_count(raw_chunk_frames),
+            )
+        else:
+            frames_per_batch = effective_frame_count
+
+        frames_per_batch = max(1, int(frames_per_batch))
+
+        return (
+            float(resolved_fps),
+            float(source_fps),
+            int(effective_frame_count),
+            float(effective_duration),
+            int(source_width),
+            int(source_height),
+            int(frame_load_cap),
+            frames_per_batch,
+            float(source_duration),
+        )
+
+    @classmethod
+    def IS_CHANGED(cls, video_path, **kwargs):
+        video_path = str(video_path).strip().strip('"')
+        if not video_path or not os.path.isfile(video_path):
+            return float("nan")
+        return os.path.getmtime(video_path)
+
+
 NODE_CLASS_MAPPINGS = {
     "PrependAudioSilence": PrependAudioSilence,
     "LTXFramesFromAudio": LTXFramesFromAudio,
     "SEOptionalMetaBatch": SEOptionalMetaBatch,
+    "SEMetaBatchBypassGate": SEMetaBatchBypassGate,
+    "SEAutoStreamingChunkSeconds": SEAutoStreamingChunkSeconds,
+    "SEMemoryFlushImage": SEMemoryFlushImage,
+    "SELowVRAMAudioVAELoader": SELowVRAMAudioVAELoader,
+    "SELoadVideoWithPath": SELoadVideoWithPath,
+    "SEVideoPathFromVideo": SEVideoPathFromVideo,
+    "SEVideoStreamingInfoPath": SEVideoStreamingInfoPath,
     "VideoOutpaintPrepareCanvasByPadding": VideoOutpaintPrepareCanvasByPadding,
     "VideoOutpaintReplicateCanvas": VideoOutpaintReplicateCanvas,
     "VideoOutpaintRegionCrop": VideoOutpaintRegionCrop,
@@ -143,6 +585,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PrependAudioSilence": "Prepend Audio Silence",
     "LTXFramesFromAudio": "LTX Frames From Audio",
     "SEOptionalMetaBatch": "SE Optional Meta Batch",
+    "SEMetaBatchBypassGate": "SE Meta Batch Bypass Gate",
+    "SEAutoStreamingChunkSeconds": "SE Auto Streaming Chunk Seconds",
+    "SEMemoryFlushImage": "SE Memory Flush Image",
+    "SELowVRAMAudioVAELoader": "SE Low VRAM Audio VAE Loader",
+    "SELoadVideoWithPath": "SE Load Video With Path",
+    "SEVideoPathFromVideo": "SE Video Path From Video",
+    "SEVideoStreamingInfoPath": "SE Video Streaming Info Path",
     "VideoOutpaintPrepareCanvasByPadding": "Video Outpaint Prepare Canvas By Padding",
     "VideoOutpaintReplicateCanvas": "Video Outpaint Replicate Canvas",
     "VideoOutpaintRegionCrop": "Video Outpaint Region Crop",

@@ -1,6 +1,7 @@
 import gc
 import math
 import os
+import threading
 
 import torch
 
@@ -49,6 +50,73 @@ def _fraction_to_float(value, fallback=0.0):
 def _padded_ltx_frame_count(frame_count):
     frame_count = max(1, int(frame_count))
     return int(1 + math.ceil((frame_count - 1) / 8) * 8)
+
+
+_STREAMING_LAST_FRAME_CACHE = {}
+_STREAMING_LAST_FRAME_LOCK = threading.Lock()
+
+
+def _coerce_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _streaming_last_frame_active(enabled, streaming_chunk_seconds):
+    try:
+        chunk_seconds = float(streaming_chunk_seconds)
+    except (TypeError, ValueError):
+        chunk_seconds = 0.0
+    return _coerce_bool(enabled) and chunk_seconds > 0.0
+
+
+def _streaming_cache_key(meta_batch=None):
+    meta_id = getattr(meta_batch, "unique_id", None)
+    if meta_id is not None:
+        return f"meta_batch:{meta_id}"
+    return "meta_batch:default"
+
+
+def _prompt_requeue_index(prompt=None, meta_batch=None):
+    if not isinstance(prompt, dict):
+        return 0
+
+    meta_id = getattr(meta_batch, "unique_id", None)
+    if meta_id is not None:
+        node = prompt.get(str(meta_id)) or prompt.get(meta_id)
+        if isinstance(node, dict):
+            try:
+                return int(node.get("inputs", {}).get("requeue", 0))
+            except (TypeError, ValueError):
+                return 0
+
+    for node in prompt.values():
+        if isinstance(node, dict) and node.get("class_type") == "VHS_BatchManager":
+            try:
+                return int(node.get("inputs", {}).get("requeue", 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _clear_streaming_last_frame(key):
+    with _STREAMING_LAST_FRAME_LOCK:
+        _STREAMING_LAST_FRAME_CACHE.pop(key, None)
+
+
+def _get_streaming_last_frame(key):
+    with _STREAMING_LAST_FRAME_LOCK:
+        frame = _STREAMING_LAST_FRAME_CACHE.get(key)
+    return frame.clone() if frame is not None else None
+
+
+def _store_streaming_last_frame(key, images):
+    if images is None or not hasattr(images, "dim") or images.dim() < 4 or images.shape[0] <= 0:
+        return False
+    last_frame = images[-1:].detach().cpu().clone()
+    with _STREAMING_LAST_FRAME_LOCK:
+        _STREAMING_LAST_FRAME_CACHE[key] = last_frame
+    return True
 
 
 class PrependAudioSilence:
@@ -193,6 +261,135 @@ class SEMetaBatchBypassGate:
             meta_batch.close_inputs()
             meta_batch.has_closed_inputs = True
         return (image,)
+
+
+class SEStreamingLastFrameReferenceImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "enabled": ("BOOLEAN", {"default": False}),
+                "streaming_chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 100000.0,
+                        "step": 0.001,
+                    },
+                ),
+            },
+            "optional": {
+                "meta_batch": ("VHS_BatchManager",),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "select"
+    CATEGORY = "video"
+
+    def select(
+        self,
+        image,
+        enabled=False,
+        streaming_chunk_seconds=0.0,
+        meta_batch=None,
+        prompt=None,
+        unique_id=None,
+    ):
+        key = _streaming_cache_key(meta_batch)
+        requeue = _prompt_requeue_index(prompt, meta_batch)
+        if not _streaming_last_frame_active(enabled, streaming_chunk_seconds):
+            _clear_streaming_last_frame(key)
+            return (image,)
+
+        if requeue <= 0:
+            _clear_streaming_last_frame(key)
+            print("[SECoursesAudioTools] streaming last-frame reference: first chunk uses input image")
+            return (image,)
+
+        cached = _get_streaming_last_frame(key)
+        if cached is None:
+            print(
+                "[SECoursesAudioTools] streaming last-frame reference: "
+                "no cached frame found; using input image"
+            )
+            return (image,)
+
+        if hasattr(image, "device"):
+            cached = cached.to(device=image.device, dtype=image.dtype)
+        print(
+            "[SECoursesAudioTools] streaming last-frame reference: "
+            f"using previous chunk last frame for requeue {requeue}"
+        )
+        return (cached,)
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("nan")
+
+
+class SEStreamingLastFrameRecorder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "enabled": ("BOOLEAN", {"default": False}),
+                "streaming_chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 100000.0,
+                        "step": 0.001,
+                    },
+                ),
+            },
+            "optional": {
+                "meta_batch": ("VHS_BatchManager",),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "record"
+    CATEGORY = "video"
+
+    def record(
+        self,
+        images,
+        enabled=False,
+        streaming_chunk_seconds=0.0,
+        meta_batch=None,
+        prompt=None,
+        unique_id=None,
+    ):
+        key = _streaming_cache_key(meta_batch)
+        if not _streaming_last_frame_active(enabled, streaming_chunk_seconds):
+            _clear_streaming_last_frame(key)
+            return (images,)
+
+        if _prompt_requeue_index(prompt, meta_batch) <= 0:
+            _clear_streaming_last_frame(key)
+
+        if _store_streaming_last_frame(key, images):
+            print("[SECoursesAudioTools] streaming last-frame recorder: stored chunk last frame")
+        return (images,)
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return float("nan")
 
 
 class SEAutoStreamingChunkSeconds:
@@ -569,6 +766,8 @@ NODE_CLASS_MAPPINGS = {
     "LTXFramesFromAudio": LTXFramesFromAudio,
     "SEOptionalMetaBatch": SEOptionalMetaBatch,
     "SEMetaBatchBypassGate": SEMetaBatchBypassGate,
+    "SEStreamingLastFrameReferenceImage": SEStreamingLastFrameReferenceImage,
+    "SEStreamingLastFrameRecorder": SEStreamingLastFrameRecorder,
     "SEAutoStreamingChunkSeconds": SEAutoStreamingChunkSeconds,
     "SEMemoryFlushImage": SEMemoryFlushImage,
     "SELowVRAMAudioVAELoader": SELowVRAMAudioVAELoader,
@@ -586,6 +785,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXFramesFromAudio": "LTX Frames From Audio",
     "SEOptionalMetaBatch": "SE Optional Meta Batch",
     "SEMetaBatchBypassGate": "SE Meta Batch Bypass Gate",
+    "SEStreamingLastFrameReferenceImage": "SE Streaming Last Frame Reference Image",
+    "SEStreamingLastFrameRecorder": "SE Streaming Last Frame Recorder",
     "SEAutoStreamingChunkSeconds": "SE Auto Streaming Chunk Seconds",
     "SEMemoryFlushImage": "SE Memory Flush Image",
     "SELowVRAMAudioVAELoader": "SE Low VRAM Audio VAE Loader",

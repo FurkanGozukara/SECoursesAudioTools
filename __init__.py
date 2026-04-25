@@ -108,9 +108,31 @@ class LTXFramesFromAudio:
         return (frames, duration_seconds)
 
 
+class SEOptionalMetaBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "enabled": ("BOOLEAN",),
+            },
+            "optional": {
+                "meta_batch": ("VHS_BatchManager",),
+            },
+        }
+
+    RETURN_TYPES = ("VHS_BatchManager",)
+    RETURN_NAMES = ("meta_batch",)
+    FUNCTION = "select"
+    CATEGORY = "video"
+
+    def select(self, enabled, meta_batch=None):
+        return (meta_batch if enabled else None,)
+
+
 NODE_CLASS_MAPPINGS = {
     "PrependAudioSilence": PrependAudioSilence,
     "LTXFramesFromAudio": LTXFramesFromAudio,
+    "SEOptionalMetaBatch": SEOptionalMetaBatch,
     "VideoOutpaintPrepareCanvasByPadding": VideoOutpaintPrepareCanvasByPadding,
     "VideoOutpaintReplicateCanvas": VideoOutpaintReplicateCanvas,
     "VideoOutpaintRegionCrop": VideoOutpaintRegionCrop,
@@ -120,6 +142,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PrependAudioSilence": "Prepend Audio Silence",
     "LTXFramesFromAudio": "LTX Frames From Audio",
+    "SEOptionalMetaBatch": "SE Optional Meta Batch",
     "VideoOutpaintPrepareCanvasByPadding": "Video Outpaint Prepare Canvas By Padding",
     "VideoOutpaintReplicateCanvas": "Video Outpaint Replicate Canvas",
     "VideoOutpaintRegionCrop": "Video Outpaint Region Crop",

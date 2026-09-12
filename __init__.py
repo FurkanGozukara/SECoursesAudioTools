@@ -11,6 +11,10 @@ from .video_outpaint import (
     VideoOutpaintRegionCropAdvanced,
     VideoOutpaintReplicateCanvas,
 )
+from .ltx25_a2v_nodes import (
+    NODE_CLASS_MAPPINGS as LTX25_A2V_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as LTX25_A2V_NODE_DISPLAY_NAME_MAPPINGS,
+)
 
 
 class SEAnyType(str):
@@ -798,6 +802,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoOutpaintRegionCrop": "Video Outpaint Region Crop",
     "VideoOutpaintRegionCropAdvanced": "Video Outpaint Region Crop Advanced",
 }
+
+NODE_CLASS_MAPPINGS.update(LTX25_A2V_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(LTX25_A2V_NODE_DISPLAY_NAME_MAPPINGS)
 
 WEB_DIRECTORY = "./web"
 

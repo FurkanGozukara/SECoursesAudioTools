@@ -237,6 +237,11 @@ class SELTX25LoadImageOptional:
             f"target video: {tw}x{th}{'  (auto from image aspect)' if auto_used else ''}\n"
             f"stage 1: {gw}x{gh}  ->  2x latent upscale: {uw}x{uh}  ->  {crop}"
         )
+        if src_w and src_h and abs(math.log((src_w / src_h) / (tw / th))) > 0.02:
+            info += (
+                f"\nWARNING: image aspect {_describe_aspect(src_w, src_h)} != target aspect {_describe_aspect(tw, th)}: "
+                f"the image is CENTER-CROPPED to the target (framing changes). Set target 0 / 0 for an auto size that matches the image."
+            )
         print(f"{LOG_PREFIX} {info.replace(chr(10), ' | ')}")
         return {"ui": {"text": [info]}, "result": (image_tensor, tw, th, gw, gh, info)}
 

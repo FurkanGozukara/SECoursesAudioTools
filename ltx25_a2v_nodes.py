@@ -881,6 +881,45 @@ class SELTX25LoadConditioning:
         return True
 
 
+
+# --------------------------------------------------------------------------- #
+# Optional torch.compile toggle (off by default): pass-through when disabled
+# --------------------------------------------------------------------------- #
+class SELTX25TorchCompileOptional:
+    """Optionally wrap the diffusion model with torch.compile (same mechanism as the core TorchCompileModel node).
+
+    Off by default: the model passes through untouched. When enabled, the first run compiles for several minutes
+    and every later run with the same shapes reuses the compiled graph, which only pays off for repeated jobs."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enabled": ("BOOLEAN", {"default": False, "tooltip": "Off = no change. On = torch.compile the transformer at sample time (slow first run, faster repeats)."}),
+                "backend": (["inductor", "cudagraphs"], {"default": "inductor"}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "SECourses/LTX-2.5"
+    DESCRIPTION = "Optional torch.compile for repeated runs. Disabled by default; enabling it compiles on the first run (minutes) and speeds up later runs with the same resolution and length."
+
+    def apply(self, model, enabled, backend):
+        if not enabled:
+            return (model,)
+        from comfy_api.torch_helpers import set_torch_compile_wrapper
+
+        def skip_transformer_options(guard_entries):
+            return [("transformer_options" not in entry.name) for entry in guard_entries]
+
+        m = model.clone(disable_dynamic=True)
+        set_torch_compile_wrapper(model=m, backend=backend, options={"guard_filter_fn": skip_transformer_options})
+        print(f"{LOG_PREFIX} torch.compile enabled (backend {backend}); the first run compiles, later runs reuse it")
+        return (m,)
+
+
 NODE_CLASS_MAPPINGS = {
     "SELTX25LoadImageOptional": SELTX25LoadImageOptional,
     "SELTX25AudioPrepare": SELTX25AudioPrepare,
@@ -889,6 +928,7 @@ NODE_CLASS_MAPPINGS = {
     "SEImageFitToSize": SEImageFitToSize,
     "SELTX25SaveConditioning": SELTX25SaveConditioning,
     "SELTX25LoadConditioning": SELTX25LoadConditioning,
+    "SELTX25TorchCompileOptional": SELTX25TorchCompileOptional,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -899,4 +939,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SEImageFitToSize": "SE Fit Frames To Exact Size (center crop)",
     "SELTX25SaveConditioning": "SE LTX-2.5 Save Conditioning (.pt cache)",
     "SELTX25LoadConditioning": "SE LTX-2.5 Load Conditioning (.pt cache)",
+    "SELTX25TorchCompileOptional": "SE Torch Compile (optional, off by default)",
 }

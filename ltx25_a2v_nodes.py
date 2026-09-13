@@ -305,6 +305,17 @@ class SELTX25AudioPrepare:
                         "longer clips need a lot more VRAM/time.",
                     },
                 ),
+                "lead_in_silence_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 5.0,
+                        "step": 0.05,
+                        "tooltip": "Silence prepended before the audio so the first frame (which is the input image) does not have to be mid-word. "
+                        "0.25-0.4 s is typical for talking heads. The muxed audio gets the same lead-in, so sync is preserved.",
+                    },
+                ),
             }
         }
 
@@ -325,7 +336,7 @@ class SELTX25AudioPrepare:
         "pads the audio with silence to the exact video length, encodes it with the audio VAE and freezes the tokens."
     )
 
-    def prepare(self, audio, audio_vae, fps, start_seconds, duration_seconds, max_duration_seconds=0.0):
+    def prepare(self, audio, audio_vae, fps, start_seconds, duration_seconds, max_duration_seconds=0.0, lead_in_silence_seconds=0.0):
         if audio is None or audio.get("waveform") is None:
             raise ValueError("SELTX25AudioPrepare: no audio input.")
         waveform = audio["waveform"]
@@ -361,6 +372,10 @@ class SELTX25AudioPrepare:
             raise ValueError("SELTX25AudioPrepare: the selected audio range is shorter than 0.05 s.")
 
         segment = waveform[..., start_sample:end_sample]
+        lead_in = max(0.0, float(lead_in_silence_seconds))
+        if lead_in > 0.0:
+            lead = torch.zeros((segment.shape[0], segment.shape[1], int(round(lead_in * sample_rate))), dtype=segment.dtype, device=segment.device)
+            segment = torch.cat((lead, segment), dim=-1)
         audio_seconds = segment.shape[-1] / sample_rate
 
         frames = ltx_frame_count(audio_seconds, fps)
@@ -416,7 +431,8 @@ class SELTX25AudioPrepare:
         frozen_latent = {"samples": samples, "noise_mask": noise_mask}
 
         info_lines = [
-            f"audio: {source_seconds:.2f} s source, using {audio_seconds:.2f} s from {float(start_seconds):.2f} s"
+            f"audio: {source_seconds:.2f} s source, using {audio_seconds - lead_in:.2f} s from {float(start_seconds):.2f} s"
+            + (f"  (+{lead_in:.2f} s lead-in silence)" if lead_in > 0 else "")
             + ("  (capped by max_duration_seconds)" if capped else ""),
             f"video: {frames} frames @ {fps:g} fps = {video_seconds:.2f} s"
             + (f"  (+{video_seconds - audio_seconds:.2f} s silence tail)" if video_seconds > audio_seconds + 1e-3 else ""),
@@ -539,10 +555,219 @@ class SEImageFitToSize:
         return (images[:, y0 : y0 + height, x0 : x0 + width, :],)
 
 
+# --------------------------------------------------------------------------- #
+# 5. identity anchors (keyframe re-injection of the input image)
+# --------------------------------------------------------------------------- #
+_HAAR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "haarcascade_frontalface_default.xml")
+
+
+def _detect_face_box(rgb_uint8):
+    """Return (x0, y0, x1, y1) of the largest face or None. insightface if installed, else bundled Haar cascade."""
+    h, w = rgb_uint8.shape[:2]
+    try:
+        from insightface.app import FaceAnalysis  # optional, better detector
+
+        root = os.path.join(folder_paths.models_dir, "insightface")
+        if os.path.isdir(os.path.join(root, "models", "buffalo_l")):
+            app = FaceAnalysis(name="buffalo_l", root=root, providers=["CPUExecutionProvider"], allowed_modules=["detection"])
+            app.prepare(ctx_id=-1, det_size=(640, 640))
+            faces = app.get(rgb_uint8[:, :, ::-1].copy())
+            if faces:
+                f = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+                x0, y0, x1, y1 = [int(round(float(v))) for v in f.bbox]
+                return max(0, x0), max(0, y0), min(w, x1), min(h, y1), "insightface"
+    except Exception:
+        pass
+    try:
+        import cv2
+
+        cascade = cv2.CascadeClassifier(_HAAR_PATH)
+        if cascade.empty():
+            return None
+        gray = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2GRAY)
+        min_side = max(40, min(h, w) // 12)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_side, min_side))
+        if len(faces) == 0:
+            return None
+        x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        return int(x), int(y), int(x + fw), int(y + fh), "haar"
+    except Exception:
+        return None
+
+
+def _mouth_protect_mask(image_tensor):
+    """Pixel mask (1, H, W): 1 everywhere, 0 (feathered) over the mouth/jaw region of the detected face."""
+    rgb = (image_tensor[0, :, :, :3].detach().float().cpu().clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+    h, w = rgb.shape[:2]
+    box = _detect_face_box(rgb)
+    if box is None:
+        return None, "no face found -> anchors use the whole image"
+    x0, y0, x1, y1, detector = box
+    fw, fh = x1 - x0, y1 - y0
+    mx0, mx1 = int(x0 - 0.10 * fw), int(x1 + 0.10 * fw)
+    my0, my1 = int(y0 + 0.58 * fh), int(y1 + 0.12 * fh)
+    mask = np.ones((h, w), dtype=np.float32)
+    mask[max(0, my0):min(h, my1), max(0, mx0):min(w, mx1)] = 0.0
+    try:
+        import cv2
+
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(2.0, fw * 0.05))
+    except Exception:
+        pass
+    return torch.from_numpy(mask)[None], f"mouth region protected (face via {detector}: {fw}x{fh} px)"
+
+
+def _quiet_block(waveform, sample_rate, fps, center_frame, window_frames, total_frames):
+    """Return the 8-frame-aligned frame index within +-window that has the lowest audio energy."""
+    if waveform is None:
+        return center_frame
+    mono = waveform[0].float().mean(dim=0) if waveform.dim() == 3 else waveform.float().mean(dim=0)
+    block_samples = max(1, int(round(8.0 / fps * sample_rate)))
+    best_idx, best_rms = center_frame, None
+    lo = max(8, center_frame - window_frames)
+    hi = min(total_frames - 9, center_frame + window_frames)
+    for fi in range(lo, hi + 1, 8):
+        s0 = int(round(fi / fps * sample_rate))
+        seg = mono[s0:s0 + block_samples]
+        if seg.numel() == 0:
+            continue
+        rms = float(torch.sqrt(torch.mean(seg * seg)))
+        if best_rms is None or rms < best_rms - 1e-6:
+            best_idx, best_rms = fi, rms
+    return best_idx
+
+
+class SELTX25IdentityAnchors:
+    """Re-inject the input image as LTX keyframe guides so the face does not drift over time.
+
+    Safe rules (learned from measured runs): anchors only in the middle of the clip, never within the
+    last second, never a partial-strength anchor on the last frame (that ghosts the final frame), the
+    mouth region is excluded so lip sync is untouched, and anchors snap to the quietest nearby moment.
+    Guides are appended latent frames: put LTXVCropGuides after the stage-1 sampler.
+    """
+
+    END_MODES = ["off", "full (return to the input pose at the end)"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE", {"tooltip": "LTX-2.5 video VAE."}),
+                "latent": ("LATENT", {"tooltip": "Stage-1 video latent after the first-frame image conditioning."}),
+                "frames": ("INT", {"default": 121, "min": 9, "max": 4097, "tooltip": "Video frame count (from the SE audio node)."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0, "step": 1.0}),
+                "anchor_every_seconds": (
+                    "FLOAT",
+                    {"default": 4.0, "min": 0.0, "max": 60.0, "step": 0.5, "tooltip": "Re-inject the input image this often. 0 = no mid-clip anchors."},
+                ),
+                "anchor_strength": (
+                    "FLOAT",
+                    {"default": 0.4, "min": 0.05, "max": 1.0, "step": 0.05, "tooltip": "How hard each mid-clip anchor pulls back to the input face. 0.3-0.5 keeps motion natural."},
+                ),
+                "protect_mouth": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Exclude the mouth/jaw region from the anchors so lip sync is not pinned to the input pose."},
+                ),
+                "snap_to_quiet": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Move each anchor to the quietest moment within +-0.75 s (a pause), when audio is connected."},
+                ),
+                "end_anchor": (
+                    cls.END_MODES,
+                    {"default": "off", "tooltip": "Full-strength anchor on the last frame makes the clip end on the input pose. Partial end anchors are never used (they ghost the last frame)."},
+                ),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "The input image. Leave unconnected / 'none' upstream for audio + text to video (node passes through)."}),
+                "audio": ("AUDIO", {"tooltip": "Trimmed audio from the SE audio node, used to place anchors in pauses."}),
+                "mouth_mask": ("MASK", {"tooltip": "Optional custom attention mask (1 = anchor applies, 0 = free). Overrides the automatic mouth mask."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT", "STRING")
+    RETURN_NAMES = ("positive", "negative", "latent", "info")
+    FUNCTION = "anchor"
+    CATEGORY = "SECourses/LTX-2.5"
+    DESCRIPTION = (
+        "Identity anchors for LTX-2.5 image + audio to video: re-injects the input image as keyframe guides every few "
+        "seconds (mouth excluded, placed in pauses) so the person stays the same person. Requires LTXVCropGuides after "
+        "the stage-1 sampler. Passes through when no image is connected."
+    )
+
+    def anchor(self, positive, negative, vae, latent, frames, fps, anchor_every_seconds, anchor_strength, protect_mouth,
+               snap_to_quiet, end_anchor, image=None, audio=None, mouth_mask=None):
+        frames = int(frames)
+        fps = float(fps)
+        duration = frames / fps
+        if image is None:
+            info = "no input image -> no identity anchors (audio + text to video)"
+            print(f"{LOG_PREFIX} {info}")
+            return {"ui": {"text": [info]}, "result": (positive, negative, latent, info)}
+
+        plan = []
+        every = float(anchor_every_seconds)
+        if every > 0:
+            min_gap_end = max(1.0, 8.0 / fps)
+            t = every
+            while t <= duration - min_gap_end + 1e-6:
+                idx = int(round(t * fps / 8.0)) * 8
+                if 8 <= idx <= frames - 1 - 8:
+                    plan.append(idx)
+                t += every
+        plan = sorted(set(plan))
+
+        waveform = sample_rate = None
+        if snap_to_quiet and audio is not None and audio.get("waveform") is not None:
+            waveform, sample_rate = audio["waveform"], int(audio["sample_rate"])
+            window = int(round(0.75 * fps / 8.0)) * 8
+            snapped = []
+            for idx in plan:
+                q = _quiet_block(waveform, sample_rate, fps, idx, window, frames)
+                if snapped and q - snapped[-1] < int(fps):  # keep at least 1 s between anchors
+                    q = idx
+                snapped.append(q)
+            plan = sorted(set(snapped))
+
+        mask, mask_note = None, "mouth not protected"
+        if mouth_mask is not None:
+            mask, mask_note = mouth_mask, "custom attention mask"
+        elif protect_mouth:
+            mask, mask_note = _mouth_protect_mask(image)
+
+        from comfy_extras.nodes_lt import LTXVAddGuide
+
+        def _apply(pos, neg, lat, frame_idx, strength, attention_mask):
+            out = LTXVAddGuide.execute(pos, neg, vae, lat, image[:1], frame_idx, float(strength), attention_mask=attention_mask)
+            args = out.args if hasattr(out, "args") else out
+            return args[0], args[1], args[2]
+
+        applied = []
+        for idx in plan:
+            positive, negative, latent = _apply(positive, negative, latent, idx, anchor_strength, mask)
+            applied.append(f"{idx / fps:.2f}s (frame {idx}) @ {float(anchor_strength):g}")
+        if end_anchor != "off":
+            positive, negative, latent = _apply(positive, negative, latent, -1, 1.0, None)
+            applied.append(f"last frame @ 1.0")
+
+        if applied:
+            info = (
+                f"identity anchors: {', '.join(applied)}\n"
+                f"{mask_note}; {'placed in pauses' if waveform is not None else 'fixed spacing'}; "
+                f"video {frames} frames = {duration:.2f} s"
+            )
+        else:
+            info = f"identity anchors: none (clip {duration:.2f} s is shorter than the anchor interval)"
+        print(f"{LOG_PREFIX} {info.replace(chr(10), ' | ')}")
+        return {"ui": {"text": [info]}, "result": (positive, negative, latent, info)}
+
+
 NODE_CLASS_MAPPINGS = {
     "SELTX25LoadImageOptional": SELTX25LoadImageOptional,
     "SELTX25AudioPrepare": SELTX25AudioPrepare,
     "SELTX25ImageCondition": SELTX25ImageCondition,
+    "SELTX25IdentityAnchors": SELTX25IdentityAnchors,
     "SEImageFitToSize": SEImageFitToSize,
 }
 
@@ -550,5 +775,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SELTX25LoadImageOptional": "SE LTX-2.5 Input Image (optional) + Target Resolution",
     "SELTX25AudioPrepare": "SE LTX-2.5 Audio -> Frozen Latent + Frames",
     "SELTX25ImageCondition": "SE LTX-2.5 Image Conditioning (auto skip)",
+    "SELTX25IdentityAnchors": "SE LTX-2.5 Identity Anchors (keep the same face)",
     "SEImageFitToSize": "SE Fit Frames To Exact Size (center crop)",
 }

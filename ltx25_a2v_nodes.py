@@ -561,9 +561,15 @@ class SEImageFitToSize:
 _HAAR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "haarcascade_frontalface_default.xml")
 
 
-def _detect_face_box(rgb_uint8):
-    """Return (x0, y0, x1, y1) of the largest face or None. insightface if installed, else bundled Haar cascade."""
-    h, w = rgb_uint8.shape[:2]
+_FACE_APP = {"app": None, "tried": False}
+_MASK_CACHE = {}  # sha256 of the input image -> (mask, note); batches reuse the same few images hundreds of times
+
+
+def _face_app():
+    """insightface detector, created once per process (loading the ONNX models every call cost ~1 s per job)."""
+    if _FACE_APP["tried"]:
+        return _FACE_APP["app"]
+    _FACE_APP["tried"] = True
     try:
         from insightface.app import FaceAnalysis  # optional, better detector
 
@@ -571,6 +577,18 @@ def _detect_face_box(rgb_uint8):
         if os.path.isdir(os.path.join(root, "models", "buffalo_l")):
             app = FaceAnalysis(name="buffalo_l", root=root, providers=["CPUExecutionProvider"], allowed_modules=["detection"])
             app.prepare(ctx_id=-1, det_size=(640, 640))
+            _FACE_APP["app"] = app
+    except Exception:
+        _FACE_APP["app"] = None
+    return _FACE_APP["app"]
+
+
+def _detect_face_box(rgb_uint8):
+    """Return (x0, y0, x1, y1) of the largest face or None. insightface if installed, else bundled Haar cascade."""
+    h, w = rgb_uint8.shape[:2]
+    try:
+        app = _face_app()
+        if app is not None:
             faces = app.get(rgb_uint8[:, :, ::-1].copy())
             if faces:
                 f = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
@@ -599,8 +617,16 @@ def _mouth_protect_mask(image_tensor):
     """Pixel mask (1, H, W): 1 everywhere, 0 (feathered) over the mouth/jaw region of the detected face."""
     rgb = (image_tensor[0, :, :, :3].detach().float().cpu().clamp(0, 1).numpy() * 255.0).astype(np.uint8)
     h, w = rgb.shape[:2]
+    key = hashlib.sha256(rgb.tobytes()).hexdigest()
+    cached = _MASK_CACHE.get(key)
+    if cached is not None:
+        mask, note = cached
+        return (mask.clone() if mask is not None else None), note + " (cached)"
     box = _detect_face_box(rgb)
     if box is None:
+        if len(_MASK_CACHE) > 64:
+            _MASK_CACHE.clear()
+        _MASK_CACHE[key] = (None, "no face found -> anchors use the whole image")
         return None, "no face found -> anchors use the whole image"
     x0, y0, x1, y1, detector = box
     fw, fh = x1 - x0, y1 - y0
@@ -614,7 +640,11 @@ def _mouth_protect_mask(image_tensor):
         mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(2.0, fw * 0.05))
     except Exception:
         pass
-    return torch.from_numpy(mask)[None], f"mouth region protected (face via {detector}: {fw}x{fh} px)"
+    result = torch.from_numpy(mask)[None]
+    if len(_MASK_CACHE) > 64:
+        _MASK_CACHE.clear()
+    _MASK_CACHE[key] = (result.clone(), f"mouth region protected (face via {detector}: {fw}x{fh} px)")
+    return result, f"mouth region protected (face via {detector}: {fw}x{fh} px)"
 
 
 def _quiet_block(waveform, sample_rate, fps, center_frame, window_frames, total_frames):

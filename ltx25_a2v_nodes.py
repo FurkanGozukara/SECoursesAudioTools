@@ -793,12 +793,102 @@ class SELTX25IdentityAnchors:
         return {"ui": {"text": [info]}, "result": (positive, negative, latent, info)}
 
 
+
+# --------------------------------------------------------------------------- #
+# Conditioning cache: encode a prompt once, reuse it in hundreds of jobs without reloading the text encoder
+# --------------------------------------------------------------------------- #
+def _cond_to_cpu(conditioning):
+    out = []
+    for item in conditioning:
+        tensor, meta = item[0], item[1] if len(item) > 1 else {}
+        meta_out = {}
+        for k, v in dict(meta).items():
+            if torch.is_tensor(v):
+                meta_out[k] = v.detach().cpu()
+            elif isinstance(v, (int, float, str, bool, list, tuple, type(None))):
+                meta_out[k] = v
+            # anything else (model patches, callables) cannot be cached and is dropped
+        out.append([tensor.detach().cpu(), meta_out])
+    return out
+
+
+class SELTX25SaveConditioning:
+    """Save a CONDITIONING (any text encoder) to a .pt file so a batch can skip the text encoder entirely."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "conditioning": ("CONDITIONING",),
+                "path": ("STRING", {"default": "", "tooltip": "Absolute .pt path (folders are created). Relative paths go under the ComfyUI output folder."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("path",)
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = "SECourses/LTX-2.5"
+    DESCRIPTION = "Writes the conditioning tensors to a .pt file. Load it with SE LTX-2.5 Load Conditioning instead of running the text encoder again."
+
+    def save(self, conditioning, path):
+        if not path:
+            raise ValueError("path is empty")
+        if not os.path.isabs(path):
+            path = os.path.join(folder_paths.get_output_directory(), path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = _cond_to_cpu(conditioning)
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+        shapes = ", ".join("x".join(str(d) for d in c[0].shape) + f" {c[0].dtype}".replace("torch.", "") for c in payload)
+        info = f"saved conditioning ({shapes}) -> {path}"
+        print(f"{LOG_PREFIX} {info}")
+        return {"ui": {"text": [info]}, "result": (path,)}
+
+
+class SELTX25LoadConditioning:
+    """Load a CONDITIONING saved by SE LTX-2.5 Save Conditioning."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"path": ("STRING", {"default": "", "tooltip": "Absolute .pt path written by SE LTX-2.5 Save Conditioning."})}}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "load"
+    CATEGORY = "SECourses/LTX-2.5"
+    DESCRIPTION = "Returns a cached conditioning; the text encoder is not loaded at all."
+
+    def load(self, path):
+        if not os.path.isabs(path):
+            path = os.path.join(folder_paths.get_output_directory(), path)
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return ([[c[0], dict(c[1])] for c in payload],)
+
+    @classmethod
+    def IS_CHANGED(cls, path):
+        try:
+            st = os.stat(path if os.path.isabs(path) else os.path.join(folder_paths.get_output_directory(), path))
+            return f"{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            return float("nan")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, path):
+        full = path if os.path.isabs(path) else os.path.join(folder_paths.get_output_directory(), path)
+        if not path or not os.path.isfile(full):
+            return f"conditioning file not found: {path}"
+        return True
+
+
 NODE_CLASS_MAPPINGS = {
     "SELTX25LoadImageOptional": SELTX25LoadImageOptional,
     "SELTX25AudioPrepare": SELTX25AudioPrepare,
     "SELTX25ImageCondition": SELTX25ImageCondition,
     "SELTX25IdentityAnchors": SELTX25IdentityAnchors,
     "SEImageFitToSize": SEImageFitToSize,
+    "SELTX25SaveConditioning": SELTX25SaveConditioning,
+    "SELTX25LoadConditioning": SELTX25LoadConditioning,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -807,4 +897,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SELTX25ImageCondition": "SE LTX-2.5 Image Conditioning (auto skip)",
     "SELTX25IdentityAnchors": "SE LTX-2.5 Identity Anchors (keep the same face)",
     "SEImageFitToSize": "SE Fit Frames To Exact Size (center crop)",
+    "SELTX25SaveConditioning": "SE LTX-2.5 Save Conditioning (.pt cache)",
+    "SELTX25LoadConditioning": "SE LTX-2.5 Load Conditioning (.pt cache)",
 }

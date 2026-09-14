@@ -74,6 +74,8 @@ TEXT_MODES = ["slide per request (TaoMate)", "fixed at start"]
 KV_DTYPES = ["fp8_e4m3", "bf16"]
 KV_DEVICES = ["auto", "gpu", "cpu pinned", "cpu"]
 WEIGHT_MODES = ["resident (non-dynamic load, fastest when it fits)", "dynamic (ComfyUI default streaming)"]
+STREAM_START_KEY = "h3_stream_start_seconds"
+STREAM_END_KEY = "h3_stream_end_seconds"
 DEFAULT_SAMPLE_RATE = 32000
 DEFAULT_HOP = 800
 FP8_MAX = 448.0
@@ -565,17 +567,29 @@ class H3StreamingRun:
     # -- conditioning ------------------------------------------------------
 
     def prepare_conditioning(self, lat_h, lat_w, seed):
-        cond = self.positive[0]
-        cross_attn = cond[0]
-        extra = cond[1]
-        text = self.dm.preprocess_text_embeds(cross_attn.to(device=self.device, dtype=self.dtype))[0]
-        self.text_states = text.contiguous()
-        tags = extra.get("minimax_token_tags")
-        if tags is None:
-            tags = torch.ones(text.shape[0], dtype=torch.long)
-        self.text_tags = tags.view(-1).to(torch.long).cpu()
-        if self.text_tags.shape[0] != text.shape[0]:
-            raise ValueError("MiniMax H3 text token tags do not match the text embeddings")
+        """Build the prompt schedule (one or more conditioning entries) and the first-frame rows."""
+        entries = []
+        for index, cond in enumerate(self.positive):
+            extra = cond[1]
+            start = float(extra.get(STREAM_START_KEY, 0.0 if index == 0 else float("inf")))
+            end = float(extra.get(STREAM_END_KEY, float("inf")))
+            tags = extra.get("minimax_token_tags")
+            length = int(cond[0].shape[1])
+            if tags is None:
+                tags = torch.ones(length, dtype=torch.long)
+            tags = tags.view(-1).to(torch.long).cpu()
+            if tags.shape[0] != length:
+                raise ValueError("MiniMax H3 text token tags do not match the text embeddings")
+            entries.append({"index": index, "start": start, "end": end, "cross_attn": cond[0], "tags": tags, "text": None})
+        if len(entries) > 1 and all(e["start"] == float("inf") for e in entries[1:]):
+            # a plain ConditioningCombine without time ranges: use the first entry only
+            entries = entries[:1]
+        entries.sort(key=lambda e: (e["start"], e["index"]))
+        entries[0]["start"] = 0.0
+        self.entries = entries
+        self.current_entry = None
+        self.select_entry(0.0)
+        extra = self.positive[0][1]
         rows = []
         aug = float(extra.get("minimax_visual_cond_noise_aug", h3.VISUAL_COND_TIMESTEP))
         for kf in extra.get("minimax_keyframes", []) or []:
@@ -598,7 +612,29 @@ class H3StreamingRun:
             rows.append(r.to(self.device))
         self.cond_rows = torch.cat(rows, dim=0) if rows else None
         self.cond_aug = aug
-        return self.text_states.shape[0]
+        return max(int(e["cross_attn"].shape[1]) for e in self.entries)
+
+    def entry_for_time(self, seconds):
+        chosen = self.entries[0]
+        for entry in self.entries:
+            if entry["start"] <= seconds + 1e-6:
+                chosen = entry
+            else:
+                break
+        return chosen
+
+    def select_entry(self, seconds):
+        """Refine the prompt of the schedule entry active at `seconds` (once per entry)."""
+        entry = self.entry_for_time(seconds)
+        if entry is self.current_entry:
+            return False
+        if entry["text"] is None:
+            text = self.dm.preprocess_text_embeds(entry["cross_attn"].to(device=self.device, dtype=self.dtype))[0]
+            entry["text"] = text.contiguous()
+        self.text_states = entry["text"]
+        self.text_tags = entry["tags"]
+        self.current_entry = entry
+        return True
 
     # -- one packed chunk forward ------------------------------------------
 
@@ -611,9 +647,9 @@ class H3StreamingRun:
             return torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))
         return dm.time_embedder(t_vals).to(self.dtype)
 
-    def build_layout(self, chunk, lat_h, lat_w, text_len, prompt_start, use_anchor):
+    def build_layout(self, chunk, lat_h, lat_w, text_len, prompt_start, use_anchor, origin=None):
         """Row segments + RoPE table for one chunk on the global timeline."""
-        origin = float(text_len)
+        origin = float(text_len) if origin is None else float(origin)
         frame, w_grid = h3._frame_grid(lat_h, lat_w)
         frame_rows = frame.shape[0]
         pos = []
@@ -737,7 +773,8 @@ class H3StreamingRun:
         lat_h, lat_w = video_latent.shape[3], video_latent.shape[4]
         frame_rows = (lat_h // 2) * (lat_w // 2)
         text_len = self.text_states.shape[0]
-        origin = float(text_len)
+        origin = float(text_len)  # the media time origin stays at the first prompt's length (TaoMate: constant media_time_origin)
+        prompt_switches = 0
         heads, head_dim = dm.blocks[0].attn.heads, dm.blocks[0].attn.head_dim
         self.cache = KVCache(len(dm.blocks), o["kv_cache_dtype"], "cpu" if o["kv_cache_device"].startswith("cpu") else device, device,
                              pinned=o["kv_cache_device"] == "cpu pinned")
@@ -761,6 +798,12 @@ class H3StreamingRun:
             chunk_started = time.perf_counter()
             if chunk["request"] != current_request:
                 current_request = chunk["request"]
+                if self.select_entry(chunk["frame_start"] / FPS):
+                    text_len = self.text_states.shape[0]
+                    prompt_switches += 1
+                    if len(self.entries) > 1:
+                        log(f"[H3 Streaming] request {current_request} (t={chunk['frame_start'] / FPS:.1f}s): prompt segment "
+                            f"{self.current_entry['index']} ({self.current_entry['start']:.1f}s-{self.current_entry['end']:.1f}s), {text_len} text rows")
                 if o["text_position"] == TEXT_MODES[0]:
                     prompt_start = origin + FRAME_RESCALE * frames_before(chunk["lat_start"]) - text_len
                 else:
@@ -769,7 +812,7 @@ class H3StreamingRun:
                     removed = self.cache.drop_audio()
                     log(f"[H3 Streaming] request {current_request}: dropped {removed} audio KV rows (TaoMate audio reset)")
             use_anchor = o["first_frame_anchor"] == ANCHOR_MODES[0] or (o["first_frame_anchor"] == ANCHOR_MODES[1] and chunk["request"] == 0)
-            layout = self.build_layout(chunk, lat_h, lat_w, text_len, prompt_start, use_anchor)
+            layout = self.build_layout(chunk, lat_h, lat_w, text_len, prompt_start, use_anchor, origin=origin)
             generator = torch.Generator("cpu").manual_seed(int(seed) + 1000003 * chunk["index"])
             video_t = chunk["lat_stop"] - chunk["lat_start"]
             noise_v = torch.randn(1, 24, video_t, lat_h, lat_w, generator=generator, dtype=torch.float32)
@@ -828,6 +871,8 @@ class H3StreamingRun:
                     if not final:
                         mm.load_models_gpu([self.mp], memory_required=self.memory_estimate)
         self.timing["stream_seconds"] = time.perf_counter() - stream_started
+        self.timing["prompt_segments"] = len(self.entries)
+        self.timing["prompt_switches"] = prompt_switches
         self.timing["attention_kernel_calls"] = self.attention.kernel_calls
         self.timing["kv_rows_final"] = self.cache.rows
         self.cache.clear()
@@ -966,7 +1011,7 @@ class SEH3StreamingSampler:
         kv_bytes_per_row = layers * 2 * heads * head_dim * (1 if kv_cache_dtype == "fp8_e4m3" else 2) + layers * 2 * heads * 2
         peak_rows = history_rows + max_chunk_rows  # the new chunk is staged before the oldest one is dropped
         peak_cache_bytes = peak_rows * kv_bytes_per_row
-        text_len_estimate = int(positive[0][0].shape[1]) + (frame_rows if first_frame_anchor != ANCHOR_MODES[2] else 0)
+        text_len_estimate = max(int(c[0].shape[1]) for c in positive) + (frame_rows if first_frame_anchor != ANCHOR_MODES[2] else 0)
         seq = max_chunk_rows + text_len_estimate
         activation_bytes = seq * 200_000 + (history_rows + seq) * heads * head_dim * 2 * 2 * 2 + 768 * 1024 ** 2
         device = model.load_device
@@ -1054,5 +1099,93 @@ class SEH3StreamingSampler:
         return {"ui": {"text": [text]}, "result": (out_latent, out_audio, video_output, video_path, text)}
 
 
-NODE_CLASS_MAPPINGS = {"SEH3StreamingSampler": SEH3StreamingSampler}
-NODE_DISPLAY_NAME_MAPPINGS = {"SEH3StreamingSampler": "H3 Streaming Sampler - TaoMate 3-Step (Audio + Image -> Long Video)"}
+
+class SEH3StreamingPromptSchedule:
+    """Encode one MiniMax H3 FL2VA prompt per time window for the streaming sampler."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip": ("CLIP", {"tooltip": "MiniMax H3 text/vision encoder."}),
+                "vae": ("VAE", {"tooltip": "MiniMax H3 video VAE (encodes the optional first frame)."}),
+                "width": ("INT", {"default": 512, "min": 32, "max": 8192, "step": 32}),
+                "height": ("INT", {"default": 768, "min": 32, "max": 8192, "step": 32}),
+                "segments": ("STRING", {"multiline": True, "default": "", "tooltip": (
+                    "JSON: {\"segments\": [{\"start\": 0, \"end\": 5.17, \"prompt\": \"...\"}, ...]} or a bare list. One full H3 prompt per time "
+                    "window; the streaming sampler switches prompts at its 5 second request boundaries. Times are seconds of the video. "
+                    "A single segment (or plain text) is used for the whole video.")}),
+            },
+            "optional": {
+                "first_frame": ("IMAGE", {"tooltip": "Optional presenter frame, added to every segment as <Picture 1> and as the first-frame anchor."}),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT", "INT")
+    RETURN_NAMES = ("positive", "latent", "segment_count")
+    FUNCTION = "encode"
+    CATEGORY = "SECourses/MiniMax H3 Lip Synch"
+    DESCRIPTION = "One conditioning entry per time window (start/end seconds) for the H3 Streaming Sampler; each entry carries the same first-frame anchor."
+
+    @staticmethod
+    def parse_segments(text):
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("segments is empty; give at least one prompt")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return [{"start": 0.0, "end": float("inf"), "prompt": text}]
+        if isinstance(payload, dict):
+            payload = payload.get("segments", payload.get("prompts", []))
+        if isinstance(payload, str):
+            return [{"start": 0.0, "end": float("inf"), "prompt": payload}]
+        segments = []
+        for index, item in enumerate(payload):
+            if isinstance(item, str):
+                item = {"start": index * 5.0, "end": (index + 1) * 5.0, "prompt": item}
+            prompt = str(item.get("prompt", item.get("text", ""))).strip()
+            if not prompt:
+                raise ValueError(f"segment {index} has no prompt")
+            start = float(item.get("start", index * 5.0))
+            end = item.get("end")
+            end = float("inf") if end is None else float(end)
+            segments.append({"start": start, "end": end, "prompt": prompt})
+        if not segments:
+            raise ValueError("no prompt segments found")
+        segments.sort(key=lambda s: s["start"])
+        return segments
+
+    def encode(self, clip, vae, width, height, segments, first_frame=None):
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo
+
+        parsed = self.parse_segments(segments)
+        conditioning = []
+        latent = None
+        keyframes = None
+        started = time.perf_counter()
+        for index, segment in enumerate(parsed):
+            # every segment is encoded with the picture block so each prompt is a complete FL2VA presentation;
+            # the (identical) first-frame latent of segment 0 is shared to avoid re-encoding it
+            output = MiniMaxH3ImageToVideo.execute(clip=clip, vae=vae, prompt=segment["prompt"], width=int(width), height=int(height),
+                                                   length=124, first_frame=first_frame)
+            cond = output.args[0]
+            if latent is None:
+                latent = output.args[1]
+            for entry in cond:
+                values = dict(entry[1])
+                if keyframes is None and values.get("minimax_keyframes"):
+                    keyframes = values["minimax_keyframes"]
+                if keyframes is not None:
+                    values["minimax_keyframes"] = keyframes
+                values[STREAM_START_KEY] = segment["start"]
+                values[STREAM_END_KEY] = segment["end"]
+                conditioning.append([entry[0], values])
+        print(f"[H3 Streaming] prompt schedule: {len(parsed)} segments, first-frame anchor {'yes' if keyframes else 'no'}, "
+              f"encoded in {time.perf_counter() - started:.1f}s", flush=True)
+        return (conditioning, latent, len(parsed))
+
+
+NODE_CLASS_MAPPINGS = {"SEH3StreamingSampler": SEH3StreamingSampler, "SEH3StreamingPromptSchedule": SEH3StreamingPromptSchedule}
+NODE_DISPLAY_NAME_MAPPINGS = {"SEH3StreamingSampler": "H3 Streaming Sampler - TaoMate 3-Step (Audio + Image -> Long Video)",
+                              "SEH3StreamingPromptSchedule": "H3 Streaming Prompt Schedule (one prompt per 5 s window)"}

@@ -446,11 +446,14 @@ class FFmpegWriter:
             pass
 
 
-def mux_audio(video_only, wav_path, output, seconds):
+def mux_audio(video_only, wav_path, output, seconds, frames=None):
     binary = shutil.which("ffmpeg")
     command = [binary, "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", video_only, "-i", wav_path,
                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-               "-t", f"{seconds:.4f}", "-movflags", "+faststart", output]
+               "-t", f"{seconds:.4f}"]
+    if frames:
+        command += ["-frames:v", str(int(frames))]
+    command += ["-movflags", "+faststart", output]
     completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if completed.returncode != 0:
@@ -1016,7 +1019,7 @@ class SEH3StreamingSampler:
             if writer is not None:
                 writer.close()
                 write_wav(temp_wav, fit_waveform(waveform, int(round(audio_seconds * sample_rate))), sample_rate)
-                mux_audio(temp_video, temp_wav, video_path, audio_seconds)
+                mux_audio(temp_video, temp_wav, video_path, audio_seconds, frames=int(round(audio_seconds * FPS)))
                 for path in (temp_video, temp_wav):
                     try:
                         os.remove(path)

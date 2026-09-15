@@ -883,8 +883,184 @@ class SELTX25LoadConditioning:
 
 
 # --------------------------------------------------------------------------- #
+# Fast tiled video decode: ComfyUI's tile geometry and feathering, accumulated on the GPU
+# --------------------------------------------------------------------------- #
+def _tile_positions(size, tile, overlap):
+    """Same tile start positions as comfy.utils.tiled_scale_multidim."""
+    if size <= tile:
+        return [0]
+    return list(range(0, size - overlap, tile - overlap))
+
+
+def _feather_mask(shape, feathers, device, dtype):
+    """(1, 1, T, H, W) blend mask with linear ramps of `feathers[d]` samples at both ends of each dim (core tiler rule)."""
+    mask = torch.ones((1, 1) + tuple(shape), device=device, dtype=dtype)
+    for d, feather in enumerate(feathers):
+        dim = d + 2
+        if feather <= 0 or feather >= mask.shape[dim]:
+            continue
+        ramp = (torch.arange(feather, device=device, dtype=dtype) + 1) / feather
+        view = [1, 1, 1, 1, 1]
+        view[dim] = feather
+        mask.narrow(dim, 0, feather).mul_(ramp.view(view))
+        mask.narrow(dim, mask.shape[dim] - feather, feather).mul_(ramp.flip(0).view(view))
+    return mask
+
+
+def decode_video_latent_gpu_tiled(vae, samples, tile_w, tile_h, overlap, tile_t, overlap_t, acc_dtype=torch.float16):
+    """Decode an LTX video latent (1, C, T, H, W) tile by tile and blend the tiles on the GPU.
+
+    Tile positions, per-tile decoder call (same seeded decoder noise), feather ramps and output placement follow
+    ComfyUI's VAEDecodeTiled -> tiled_scale_multidim exactly, so with the shipped geometry the frames match the core
+    node; the difference is where the work happens: the core tiler copies every decoded tile to the CPU in float32
+    and blends there, this keeps everything on the GPU and copies the finished video once.
+    Returns (T, H, W, 3) float32 on the CPU (ComfyUI IMAGE layout)."""
+    device = vae.device
+    tc = vae.upscale_index_formula  # (8, 32, 32) for LTX
+    t_up = tc[0]
+    sp = tc[1]
+    x = samples
+    T, H, W = x.shape[2], x.shape[3], x.shape[4]
+    out_frames = max(0, T * t_up - (t_up - 1))
+    out_h, out_w = H * sp, W * sp
+    acc = torch.zeros((1, 3, out_frames, out_h, out_w), device=device, dtype=acc_dtype)
+    div = torch.zeros((1, 1, out_frames, out_h, out_w), device=device, dtype=acc_dtype)
+    pt, ph, pw = _tile_positions(T, tile_t, overlap_t), _tile_positions(H, tile_h, overlap), _tile_positions(W, tile_w, overlap)
+    feather_t = max(0, overlap_t * t_up - (t_up - 1))
+    feather_s = overlap * sp
+    decoded = 0
+    pbar = comfy.utils.ProgressBar(len(pt) * len(ph) * len(pw))
+    with torch.no_grad():
+        for t0 in pt:
+            t0 = max(0, min(T - overlap_t, t0))
+            lt = min(tile_t, T - t0)
+            for y0 in ph:
+                y0 = max(0, min(H - overlap, y0))
+                lh = min(tile_h, H - y0)
+                for x0 in pw:
+                    x0 = max(0, min(W - overlap, x0))
+                    lw = min(tile_w, W - x0)
+                    tile = x[:, :, t0:t0 + lt, y0:y0 + lh, x0:x0 + lw].to(device=device, dtype=vae.vae_dtype)
+                    ps = vae.first_stage_model.decode(tile)
+                    ft, fh, fw = ps.shape[2], ps.shape[3], ps.shape[4]
+                    mask = _feather_mask((ft, fh, fw), (feather_t, feather_s, feather_s), device, acc_dtype)
+                    ot, oy, ox = t0 * t_up, y0 * sp, x0 * sp
+                    lt_o, lh_o, lw_o = min(ft, out_frames - ot), min(fh, out_h - oy), min(fw, out_w - ox)
+                    acc[:, :, ot:ot + lt_o, oy:oy + lh_o, ox:ox + lw_o].add_(ps[:, :, :lt_o, :lh_o, :lw_o].to(acc_dtype) * mask[:, :, :lt_o, :lh_o, :lw_o])
+                    div[:, :, ot:ot + lt_o, oy:oy + lh_o, ox:ox + lw_o].add_(mask[:, :, :lt_o, :lh_o, :lw_o])
+                    del ps, mask, tile
+                    decoded += 1
+                    pbar.update(1)
+        acc.div_(div)
+        del div
+        out = torch.empty((out_frames, out_h, out_w, 3), dtype=torch.float32, device="cpu")
+        step = max(1, (256 * 1024 * 1024) // max(1, out_h * out_w * 3 * 4))  # ~256 MB per copy
+        for f0 in range(0, out_frames, step):
+            out[f0:f0 + step].copy_(acc[0, :, f0:f0 + step].permute(1, 2, 3, 0).float())
+        del acc
+    return out, decoded
+
+
+class SELTX25VideoDecodeFast:
+    """Tiled LTX-2.5 video decode with GPU-side blending (same tiles and feathering as VAEDecodeTiled)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT",),
+                "vae": ("VAE",),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32, "tooltip": "Spatial tile edge in pixels (512 = the shipped VAEDecodeTiled default)."}),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Spatial tile overlap in pixels."}),
+                "temporal_size": ("INT", {"default": 128, "min": 8, "max": 4096, "step": 8, "tooltip": "Frames decoded per temporal chunk."}),
+                "temporal_overlap": ("INT", {"default": 32, "min": 8, "max": 4096, "step": 8, "tooltip": "Frames of overlap between temporal chunks."}),
+                "accumulate": (["float16", "float32"], {"default": "float16", "tooltip": "GPU blend buffer precision. float16 keeps 1/1024 steps on the -1..1 range (finer than 8-bit video); float32 needs twice the VRAM."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "decode"
+    CATEGORY = "SECourses/LTX-2.5"
+    DESCRIPTION = "Same tiles, overlap and feathering as the core VAEDecodeTiled node, but the tiles are blended on the GPU and the video is copied to the CPU once; several times less CPU work at 1080p."
+
+    def decode(self, samples, vae, tile_size, overlap, temporal_size, temporal_overlap, accumulate="float16"):
+        if tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_overlap // 2
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+        comp = vae.spacial_compression_decode()
+        tcomp = vae.temporal_compression_decode()
+        tile = tile_size // comp
+        ov = overlap // comp
+        tile_t = max(2, temporal_size // tcomp)
+        ov_t = max(1, min(tile_t // 2, temporal_overlap // tcomp))
+        acc_dtype = torch.float16 if accumulate == "float16" else torch.float32
+        T, H, W = latent.shape[2], latent.shape[3], latent.shape[4]
+        out_frames = max(0, T * tcomp - (tcomp - 1))
+        acc_bytes = out_frames * H * comp * W * comp * 4 * (2 if acc_dtype == torch.float16 else 4)
+        tile_shape = (1, latent.shape[1], min(T, tile_t), min(H, tile), min(W, tile))
+        memory_needed = vae.memory_used_decode(tile_shape, vae.vae_dtype) + acc_bytes
+        comfy.model_management.load_models_gpu([vae.patcher], memory_required=memory_needed, force_full_load=vae.disable_offload)
+        with comfy.model_management.cuda_device_context(vae.device):
+            images, tiles = decode_video_latent_gpu_tiled(vae, latent, tile, tile, ov, tile_t, ov_t, acc_dtype=acc_dtype)
+        print(f"{LOG_PREFIX} fast decode: {tiles} tile decodes ({tile * comp}px/{ov * comp}px overlap, {tile_t * tcomp} frames/{ov_t * tcomp} overlap), "
+              f"{out_frames} frames {W * comp}x{H * comp}, blended on the GPU in {accumulate}")
+        return (images,)
+
+
+# --------------------------------------------------------------------------- #
 # Optional torch.compile toggle (off by default): pass-through when disabled
 # --------------------------------------------------------------------------- #
+_COMPILE_PATCH = {"applied": False}
+
+
+def _install_compile_safe_int8_linear():
+    """Make the fused INT8 ConvRot MLP path traceable by torch.compile.
+
+    comfy.ops.linear_input_act calls comfy_kitchen's Python `int8_linear`, which hands raw data pointers to the
+    CUDA kernel through DLPack; Dynamo traces into it with fake tensors and fails ("Cannot access data pointer of
+    Tensor ... wrap the custom kernel into an opaque custom op"). comfy-kitchen also registers the same kernel as the
+    opaque custom op `torch.ops.comfy_kitchen.int8_linear` (with a fake implementation); this swaps the call to
+    that op. Same kernel, same arguments, same numbers; only the dispatch path changes."""
+    if _COMPILE_PATCH["applied"]:
+        return
+    import comfy.ops
+    import comfy.quant_ops
+    from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
+    from comfy_kitchen import DTYPE_TO_CODE
+
+    original = comfy.ops.linear_input_act
+
+    def linear_input_act_compile_safe(linear, x, input_act):
+        weight = linear.weight
+        if (comfy.model_management.in_training
+                or not isinstance(weight, QuantizedTensor)
+                or weight._layout_cls != "TensorWiseINT8Layout"
+                or getattr(weight._params, "transposed", False)):
+            return original(linear, x, input_act)
+        weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+            linear, x, offloadable=True, compute_dtype=x.dtype, want_requant=True)
+        try:
+            if not isinstance(weight, QuantizedTensor):
+                return torch.nn.functional.linear(comfy.ops.INPUT_ACT_EAGER[input_act](x), weight, bias)
+            qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+            return torch.ops.comfy_kitchen.int8_linear(
+                x.contiguous(), qdata.contiguous(), scale, bias, DTYPE_TO_CODE[x.dtype],
+                bool(getattr(weight._params, "convrot", False)),
+                int(getattr(weight._params, "convrot_groupsize", 256)),
+                input_act,
+            )
+        finally:
+            comfy.ops.uncast_bias_weight(linear, weight, bias, offload_stream)
+
+    comfy.ops.linear_input_act = linear_input_act_compile_safe
+    _COMPILE_PATCH["applied"] = True
+    print(f"{LOG_PREFIX} torch.compile: routed the fused INT8 MLP path through the opaque comfy_kitchen custom op")
+
+
 class SELTX25TorchCompileOptional:
     """Optionally wrap the diffusion model with torch.compile (same mechanism as the core TorchCompileModel node).
 
@@ -914,6 +1090,7 @@ class SELTX25TorchCompileOptional:
         def skip_transformer_options(guard_entries):
             return [("transformer_options" not in entry.name) for entry in guard_entries]
 
+        _install_compile_safe_int8_linear()
         m = model.clone(disable_dynamic=True)
         set_torch_compile_wrapper(model=m, backend=backend, options={"guard_filter_fn": skip_transformer_options})
         print(f"{LOG_PREFIX} torch.compile enabled (backend {backend}); the first run compiles, later runs reuse it")
@@ -929,6 +1106,7 @@ NODE_CLASS_MAPPINGS = {
     "SELTX25SaveConditioning": SELTX25SaveConditioning,
     "SELTX25LoadConditioning": SELTX25LoadConditioning,
     "SELTX25TorchCompileOptional": SELTX25TorchCompileOptional,
+    "SELTX25VideoDecodeFast": SELTX25VideoDecodeFast,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -940,4 +1118,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SELTX25SaveConditioning": "SE LTX-2.5 Save Conditioning (.pt cache)",
     "SELTX25LoadConditioning": "SE LTX-2.5 Load Conditioning (.pt cache)",
     "SELTX25TorchCompileOptional": "SE Torch Compile (optional, off by default)",
+    "SELTX25VideoDecodeFast": "SE LTX-2.5 Fast Tiled Video Decode (GPU blend)",
 }

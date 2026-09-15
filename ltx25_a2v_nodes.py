@@ -914,7 +914,7 @@ def decode_video_latent_gpu_tiled(vae, samples, tile_w, tile_h, overlap, tile_t,
     ComfyUI's VAEDecodeTiled -> tiled_scale_multidim exactly, so with the shipped geometry the frames match the core
     node; the difference is where the work happens: the core tiler copies every decoded tile to the CPU in float32
     and blends there, this keeps everything on the GPU and copies the finished video once.
-    Returns (T, H, W, 3) float32 on the CPU (ComfyUI IMAGE layout)."""
+    Returns (T, H, W, 3) float32 on the CPU (ComfyUI IMAGE layout), after the VAE's output transform."""
     device = vae.device
     tc = vae.upscale_index_formula  # (8, 32, 32) for LTX
     t_up = tc[0]
@@ -953,6 +953,9 @@ def decode_video_latent_gpu_tiled(vae, samples, tile_w, tile_h, overlap, tile_t,
                     pbar.update(1)
         acc.div_(div)
         del div
+        # Same output transform the core VAE decode paths apply (for LTX: (x + 1) / 2 clamped to 0..1),
+        # done on the GPU before the single copy out.
+        acc = vae.process_output(acc)
         out = torch.empty((out_frames, out_h, out_w, 3), dtype=torch.float32, device="cpu")
         step = max(1, (256 * 1024 * 1024) // max(1, out_h * out_w * 3 * 4))  # ~256 MB per copy
         for f0 in range(0, out_frames, step):

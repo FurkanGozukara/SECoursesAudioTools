@@ -273,6 +273,68 @@ multi-block VAE decoding and an off-toggle run with missing restoration weights.
 The fix is shared by ComfyUI and SwarmUI through this sampler. Restart the Comfy
 backend to activate it. The published H100 throughput is not a 5090 speed guarantee.
 
+## Exact-output speed follow-up and 8 GB budget test, 2026-09-20
+
+The adapter now computes only the timestep embeddings AvatarForever uses, selects
+the native paired RoPE operation when both streams share positions, and reuses
+identical cross-modal normalization results. CodeFormer overlaps CPU mouth
+compositing with the next GPU batch, with one bounded worker per decoded block.
+FP32 restoration, detection, batch size, fidelity, blend, model weights, sampler
+schedule and VAE tile geometry are unchanged. Its new `processing_seconds` report
+field measures elapsed mouth processing; the individual phase times overlap and
+must not be added to obtain elapsed time.
+
+Physical GPU 0, RTX 5090; same inputs and seed, INT8 ConvRot, cache off:
+
+| Measurement | Before | After | Time reduction |
+|---|---:|---:|---:|
+| LTX denoising, 60s at 512x768 | 80.64s | 78.75s | 2.3% |
+| Complete sampler, same minute with mouth enhancement | 184.91s | 172.39s | 6.8% |
+| Warm CodeFormer processing, 192 frames at 896x1344, mean of two passes | 7.83s | 6.58s | 16.0% |
+
+The complete original, optimized and constrained-memory minute-long MP4s are
+byte-identical, SHA-256
+`c1943dce7ab02e003ba7efefda4c85025b6eaf2b3f0fab696d8a527ce073b743`.
+Latents and all 16 decoded/restored frame-block hashes also match exactly.
+This establishes equality for these tests, not every possible model/backend.
+The four-second cache-on and text-only/dynamic-prefix comparisons also retained
+identical latents and frame hashes. Nineteen CPU tests and nine comparisons with
+upstream block math passed. SwarmUI's preset generated both mouth on/off graphs
+and a real two-second, 50-frame MP4 with a two-second audio track.
+
+**An 8 GB memory budget was simulated, not a physical 8 GB GPU tested.** The
+isolated backend used `--reserve-vram 25` on the 32 GB card, native non-dynamic
+offloading (`--disable-dynamic-vram`), and a verified hard 7 GiB PyTorch allocation
+limit. NVML also measured
+allocations outside PyTorch, including CUDA face detection. A 512x768, 60-second
+render with mouth enhancement succeeded: 1,500 saved frames, exactly 60.000s video
+and audio, 466.26s sampler time, 6.86 GiB peak total GPU usage and 4.79 GiB peak
+PyTorch sampler allocation. All 1,505 generated frames were enhanced before the
+normal export trim. No quality setting or tile size was reduced, and no new
+low-VRAM toggle was needed. The host had 96 GB RAM; worker resident RAM was sampled
+at 48.4 GiB. This does not establish suitability for a machine with little system
+RAM, or predict an actual 8 GB card's speed.
+
+The reservation is a test setting for this 32 GB card, **not a setting to copy to
+an 8 GB card**. Use `--disable-dynamic-vram` for the tested low-memory configuration;
+the existing Lowest VRAM launcher includes it. In SwarmUI, add it to the ComfyUI
+backend's ExtraArgs and restart that backend. A cold start with dynamic loading
+enabled completed but peaked at 9.10 GiB, so it does **not** validate an 8 GB budget.
+A reservation alone is not a hard memory limit, and AIMDO allocations are outside
+the PyTorch allocator cap. Native model offloading provides the working path.
+The saved unified preset's own demo inputs also passed a cold, two-second test
+at 640x640 with `--disable-dynamic-vram`: monitoring began before startup and
+covered text encoding, audio/image encoding, sampling, restoration and export.
+Peak total GPU memory was 6.27 GiB; its 50-frame MP4 matched the normal-memory
+run byte for byte.
+Both existing unified presets use this shared sampler without changes to their
+values. The test allocator cap exists only in the disposable test harness.
+
+Detailed reports and comparison videos are local evidence under
+`output/video/AvatarForever_SpeedVRAM`; no runtime or distributed preset depends
+on the development folder. Baseline node-pack revision:
+`ca7297ea2db19c6b27ac79f0f548b50b6f73aadf`.
+
 ## Implementation and attribution
 
 Two new node classes; one model-forward adapter; no ComfyUI core changes or global

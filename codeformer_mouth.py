@@ -2,6 +2,7 @@
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -92,14 +93,28 @@ class CodeFormerMouth:
                        "restoration_device": str(self.device), "restoration_dtype": "float32",
                        "detector": detector_name, "detector_provider": provider,
                        "frames": 0, "faces": 0, "detection_seconds": 0., "restoration_seconds": 0.,
-                       "compositing_seconds": 0.}
+                       "compositing_seconds": 0., "processing_seconds": 0.}
 
     def process(self, frames):
         """Consume and return owned RGB uint8 CPU frames, with bounded face batches."""
         if self.strength == 0:
             return frames
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=1) as compositor:
+            result = self._process(frames, compositor)
+        self.report["processing_seconds"] += time.perf_counter() - start
+        return result
+
+    def _composite(self, pixels, crops, restored, transforms, centers, widths, indices):
+        start = time.perf_counter()
+        for i, index in enumerate(indices):
+            blend_mouth(pixels[index], crops[i], restored[i], transforms[i], centers[i], widths[i], self.strength)
+        return time.perf_counter() - start
+
+    def _process(self, frames, compositor):
         pixels = frames.numpy()
         loaded = False
+        pending = None
         for first in range(0, len(pixels), self.batch_size):
             mm.throw_exception_if_processing_interrupted()
             crops, transforms, centers, widths, indices = [], [], [], [], []
@@ -132,8 +147,10 @@ class CodeFormerMouth:
             restored = restored.clamp(-1, 1).add(1).mul(127.5).round().permute(0, 2, 3, 1).byte().cpu().numpy()
             self.report["restoration_seconds"] += time.perf_counter() - start
             self.report["faces"] += len(crops)
-            start = time.perf_counter()
-            for i, index in enumerate(indices):
-                blend_mouth(pixels[index], crops[i], restored[i], transforms[i], centers[i], widths[i], self.strength)
-            self.report["compositing_seconds"] += time.perf_counter() - start
+            # Only the previous, disjoint frame batch is touched by this CPU worker.
+            if pending is not None:
+                self.report["compositing_seconds"] += pending.result()
+            pending = compositor.submit(self._composite, pixels, crops, restored, transforms, centers, widths, indices)
+        if pending is not None:
+            self.report["compositing_seconds"] += pending.result()
         return frames

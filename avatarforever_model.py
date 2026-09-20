@@ -60,7 +60,7 @@ def cached_block(block, args, cache, current, reuse, cache_device):
         shift, scale, gate = block.get_ada_values(table, x.shape[0], ts, slice(0, 3))
         norm = comfy.quant_ops.ck.rms_adaln(x, scale, shift)
         ctx, kpe = context(name, norm, pe, selection)
-        x = x + attn(norm, context=ctx, pe=pe, k_pe=kpe, transformer_options=to) * gate
+        x = x + attn(norm, context=ctx, pe=pe, k_pe=kpe if reuse else None, transformer_options=to) * gate
         return x + block._apply_text_cross_attention(x, text, text_attn, table, prompt_table, ts,
                                                      prompt_ts, args["attention_mask"], to)
 
@@ -83,7 +83,7 @@ def cached_block(block, args, cache, current, reuse, cache_device):
     ascale, ashift, _ = cross_values(block.scale_shift_table_a2v_ca_audio,
         args["a_cross_scale_shift_timestep"], args["a_cross_gate_timestep"], slice(0, 2), ax.shape[0])
     vx = vx + block.audio_to_video_attn(vnorm * (1 + vscale) + vshift,
-        context=rms_norm(actx) * (1 + ascale) + ashift, pe=vcpe, k_pe=actxpe,
+        context=(rms_norm(actx) if reuse else anorm) * (1 + ascale) + ashift, pe=vcpe, k_pe=actxpe,
         transformer_options=to) * vgate
 
     # Upstream reuse attends to current video AFTER a2v; the uncached path uses
@@ -95,7 +95,7 @@ def cached_block(block, args, cache, current, reuse, cache_device):
     ascale, ashift, agate = cross_values(block.scale_shift_table_a2v_ca_audio,
         args["a_cross_scale_shift_timestep"], args["a_cross_gate_timestep"], slice(2, 4), ax.shape[0])
     ax = ax + block.video_to_audio_attn(anorm * (1 + ascale) + ashift,
-        context=rms_norm(vctx) * (1 + vscale) + vshift, pe=acpe, k_pe=vctxpe,
+        context=(rms_norm(vctx) if reuse else vnorm) * (1 + vscale) + vshift, pe=acpe, k_pe=vctxpe,
         transformer_options=to) * agate
 
     for x, table, ts, ff in ((vx, block.scale_shift_table, vt, block.ff),
@@ -139,8 +139,18 @@ def avatar_forward(dm, x, timestep, context, attention_mask=None, frame_rate=25,
             mel = (mel + 1 - ap.audio_latent_downsample_factor).clamp_min(0)
         coords[1][:, 0, :, side] = mel * ap.hop_length / ap.sample_rate
 
-    ts, embedded, _ = dm._prepare_timestep(timestep[0], vx.shape[0], vx.dtype,
-                                           a_timestep=timestep[1], **extra)
+    # The native AV preparation also projects cross-modal timesteps per token,
+    # which AvatarForever replaces with scalar-sigma embeddings below.
+    batch = vx.shape[0]
+    per_frame = timestep[0].reshape(batch, -1, frame_tokens)[:, :, 0]
+    vt, ve = dm.adaln_single((per_frame * dm.timestep_scale_multiplier).flatten(),
+        {"resolution": None, "aspect_ratio": None}, batch_size=batch, hidden_dtype=vx.dtype)
+    vt = CompressedTimestep(vt.reshape(batch, -1, vt.shape[-1]), frame_tokens, per_frame=True)
+    ve = CompressedTimestep(ve.reshape(batch, -1, ve.shape[-1]), frame_tokens, per_frame=True)
+    at, ae = dm.audio_adaln_single((timestep[1] * dm.timestep_scale_multiplier).flatten(),
+        {"resolution": None, "aspect_ratio": None}, batch_size=batch, hidden_dtype=vx.dtype)
+    ts = [vt, at.reshape(batch, -1, at.shape[-1]), None, None, None]
+    embedded = [ve, ae.reshape(batch, -1, ae.shape[-1])]
     # Official modality.sigma stays sigma even with a zero audio denoise mask.
     # Both cross-modality scale/shift and gates use the OTHER stream's scalar sigma.
     def embed(module, value):

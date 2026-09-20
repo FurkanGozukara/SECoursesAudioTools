@@ -1,13 +1,16 @@
 """CPU checks for long-video coverage, bounded history and temporal decoding."""
 import math
+import threading
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 import torch
 
 from custom_nodes.SECoursesAudioTools import avatarforever_nodes as af
-from custom_nodes.SECoursesAudioTools.codeformer_mouth import blend_mouth, mouth_mask, CodeFormerMouth
+from custom_nodes.SECoursesAudioTools.codeformer_mouth import blend_mouth, mouth_mask, CodeFormerMouth, TEMPLATE
 
 
 class AvatarForeverTests(unittest.TestCase):
@@ -130,7 +133,7 @@ class AvatarForeverTests(unittest.TestCase):
         enhancer = object.__new__(CodeFormerMouth)
         enhancer.strength, enhancer.batch_size = .7, 4
         enhancer.detector = Detector()
-        enhancer.report = {'frames': 0, 'detection_seconds': 0.}
+        enhancer.report = {'frames': 0, 'detection_seconds': 0., 'processing_seconds': 0.}
         frames = torch.randint(0, 256, (5, 16, 16, 3), dtype=torch.uint8)
         original = frames.clone()
         self.assertIs(enhancer.process(frames), frames)
@@ -140,6 +143,40 @@ class AvatarForeverTests(unittest.TestCase):
         enhancer.detector = None
         self.assertIs(enhancer.process(frames), frames)
         torch.testing.assert_close(frames, original)
+
+    def test_mouth_worker_finishes_batches_and_propagates_errors(self):
+        class Detector:
+            def detect(self, image):
+                if image[0, 0, 0] % 3 == 0:
+                    return np.empty((0, 5)), None
+                return np.array([[0, 0, 32, 32, 1.]]), TEMPLATE[None]
+
+        enhancer = object.__new__(CodeFormerMouth)
+        enhancer.strength, enhancer.fidelity, enhancer.batch_size = .7, .9, 4
+        enhancer.device = torch.device('cpu')
+        enhancer.detector = Detector()
+        enhancer.patcher = SimpleNamespace(model=lambda batch, **kwargs: (torch.zeros_like(batch),))
+        enhancer.report = dict.fromkeys(('frames', 'faces', 'detection_seconds', 'restoration_seconds',
+                                         'compositing_seconds', 'processing_seconds'), 0.)
+        caller = threading.get_ident()
+        visited = []
+
+        def composite(pixels, crops, restored, transforms, centers, widths, indices):
+            self.assertNotEqual(threading.get_ident(), caller)
+            for index in indices:
+                visited.append(index)
+                pixels[index, 0, 0] = 100 + index
+            return 0.
+
+        enhancer._composite = composite
+        frames = torch.arange(10, dtype=torch.uint8).reshape(10, 1, 1, 1).expand(10, 32, 32, 3).clone()
+        with patch.object(af.mm, 'load_models_gpu'):
+            self.assertIs(enhancer.process(frames), frames)
+            self.assertEqual(visited, [1, 2, 4, 5, 7, 8])
+            self.assertEqual(frames[:, 0, 0, 0].tolist(), [0, 101, 102, 3, 104, 105, 6, 107, 108, 9])
+            with patch.object(enhancer, '_composite', side_effect=RuntimeError('compositing failed')):
+                with self.assertRaisesRegex(RuntimeError, 'compositing failed'):
+                    enhancer.process(torch.ones(4, 32, 32, 3, dtype=torch.uint8))
 
 
 if __name__ == "__main__":

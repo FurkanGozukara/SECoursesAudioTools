@@ -1,0 +1,4 @@
+spandrel-extra-arches>=0.2.0
+insightface>=0.7.3
+onnxruntime-gpu>=1.17
+opencv-python

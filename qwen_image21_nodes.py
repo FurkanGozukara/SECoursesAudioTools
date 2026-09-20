@@ -41,20 +41,24 @@ class SEQwenImage21Canvas(nodes.LoadImage):
         schema = nodes.LoadImage.INPUT_TYPES()
         values, options = schema["required"]["image"]
         schema["required"]["image"] = ([NO_IMAGE, *values], {**options, "tooltip": "Optional init canvas. Select none to disable. Right-click the image preview > Open in Mask Editor for inpainting; painted mask = area to change."})
+        schema["optional"] = {"denoise": ("FLOAT", {"default": 0.85, "min": 0.01, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength: lower keeps more of the original; 1.0 fully redraws. Inpaint applies it inside the painted mask; image-to-image applies it to the whole image. Generate/reference edit always uses 1.0."})}
         return schema
 
+    RETURN_TYPES = ("IMAGE", "MASK", "FLOAT")
+    RETURN_NAMES = ("IMAGE", "MASK", "denoise")
     CATEGORY = "SECourses/Qwen Image 2.1"
     DESCRIPTION = "Optional init image and native ComfyUI mask editor. None disables the canvas. For transparent reference images, use the gallery, which retains RGBA."
 
-    def load_image(self, image):
-        return (None, None) if image == NO_IMAGE else super().load_image(image)
+    def load_image(self, image, denoise=0.85):
+        pixels, mask = (None, None) if image == NO_IMAGE else super().load_image(image)
+        return pixels, mask, float(denoise)
 
     @classmethod
-    def IS_CHANGED(cls, image):
+    def IS_CHANGED(cls, image, denoise=0.85):
         return NO_IMAGE if image == NO_IMAGE else nodes.LoadImage.IS_CHANGED(image)
 
     @classmethod
-    def VALIDATE_INPUTS(cls, image):
+    def VALIDATE_INPUTS(cls, image, denoise=0.85):
         return True if image == NO_IMAGE else nodes.LoadImage.VALIDATE_INPUTS(image)
 
 
@@ -66,9 +70,9 @@ class SEQwenImage21Prepare:
             "mode": (MODES,),
             "width": ("INT", {"default": 1024, "min": 32, "max": 4096, "step": 32, "tooltip": "Text-only canvas. With references/init, output follows the first image's aspect ratio."}),
             "height": ("INT", {"default": 1024, "min": 32, "max": 4096, "step": 32}),
-            "reference_resolution": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 32, "tooltip": "Reference area is about this squared, preserving aspect ratio. 0 keeps original size rounded to 32. 1024 is practical; 2048 is native 2K and costs more time/VRAM."}),
+            "reference_resolution": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 32, "tooltip": "Reference / edit size (pixel-area target): resizes each input to about this value squared while preserving its aspect ratio, rounded to 32 pixels. 1024 is about 1 MP; 2048 is about 4 MP and costs more VRAM/time. 0 keeps each input's original size rounded to 32. With an init/reference, output size follows the init/first reference. Text-only uses the canvas width/height instead."}),
             "denoise": ("FLOAT", {"default": 0.85, "min": 0.01, "max": 1.0, "step": 0.01, "tooltip": "Only img2img/inpaint. Higher redraws more. Generate/reference edit always uses 1.0."}),
-            "transparent": ("BOOLEAN", {"default": False, "tooltip": "Adds the official RGBA prompt wording. Save PNG to retain alpha."}),
+            "transparent": ("BOOLEAN", {"default": False, "tooltip": "Request a transparent background: adds the official RGBA wording to the prompt. Describe an isolated subject/cutout and save as PNG. This asks the model to generate alpha; it is not a background-removal tool or the paint mask. Inpaint still preserves the original outside the mask."}),
             "negative_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Ignored by the sampler at the recommended CFG 1.0. Raise CFG only intentionally."}),
         }, "optional": {"init_image": ("IMAGE",), "mask": ("MASK",)}}
 
@@ -122,7 +126,9 @@ class SEQwenImage21Prepare:
             latent = {"samples": vae.encode(canvas)}
             if mode == MODES[2]:
                 edit_mask = torch.nn.functional.interpolate(mask[:1].reshape(1, 1, *mask.shape[-2:]).float(), size=(height, width), mode="bilinear", align_corners=False).squeeze(1).clamp(0, 1)
-                latent["noise_mask"] = edit_mask
+                # Fractional masks reinsert the original at every sampling step.
+                # Allow the painted area to denoise; feather only the final blend.
+                latent["noise_mask"] = (edit_mask > 0).float()
                 preserve = {"canvas": canvas, "mask": edit_mask}
         else:
             denoise = 1.0

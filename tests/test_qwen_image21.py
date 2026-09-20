@@ -1,7 +1,9 @@
 """Guard gallery numbering, optional input, and exact unmasked compositing."""
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -23,8 +25,36 @@ class QwenImage21Tests(unittest.TestCase):
             qwen.translate_prompt("Use @init", 1, False)
 
     def test_optional_canvas_requires_no_placeholder_file(self):
-        self.assertEqual(qwen.SEQwenImage21Canvas().load_image(qwen.NO_IMAGE), (None, None))
+        self.assertEqual(qwen.SEQwenImage21Canvas().load_image(qwen.NO_IMAGE), (None, None, .85))
         self.assertTrue(qwen.SEQwenImage21Canvas.VALIDATE_INPUTS(qwen.NO_IMAGE))
+
+    def test_canvas_denoise_preserves_native_image_and_mask(self):
+        source, mask = torch.rand(1, 32, 32, 3), torch.rand(1, 32, 32)
+        with patch.object(qwen.nodes.LoadImage, "load_image", return_value=(source, mask)):
+            result = qwen.SEQwenImage21Canvas().load_image("painted.png", .37)
+        self.assertIs(result[0], source)
+        self.assertIs(result[1], mask)
+        self.assertEqual(result[2], .37)
+        self.assertEqual(qwen.SEQwenImage21Canvas().load_image(qwen.NO_IMAGE, .37), (None, None, .37))
+
+    def test_prepare_uses_canvas_strength_only_for_img2img_and_inpaint(self):
+        source = torch.rand(1, 32, 32, 3)
+        mask = torch.zeros(1, 32, 32)
+        mask[:, 8:24, 8:24] = .7
+        encoded = torch.rand(1, 64, 2, 2)
+        vae = SimpleNamespace(encode=lambda image: encoded)
+        args = dict(clip=None, vae=vae, references={}, width=32, height=32,
+                    reference_resolution=32, denoise=.37, transparent=False,
+                    negative_prompt="", init_image=source, mask=mask)
+        with patch("comfy_extras.nodes_qwen.TextEncodeQwenImage21.execute",
+                   return_value=SimpleNamespace(result=([], [], {"samples": encoded}))):
+            for mode in qwen.MODES:
+                result = qwen.SEQwenImage21Prepare().prepare(mode=mode, **args)
+                self.assertEqual(result[3], 1.0 if mode == qwen.MODES[0] else .37)
+                self.assertEqual("noise_mask" in result[2], mode == qwen.MODES[2])
+                if mode == qwen.MODES[2]:
+                    self.assertTrue(torch.equal(result[2]["noise_mask"], (mask > 0).float()))
+                    self.assertTrue(torch.equal(result[4]["mask"], mask))
 
     def test_inpaint_preserves_rgb_and_alpha_outside_mask(self):
         source = torch.rand(1, 32, 64, 3)

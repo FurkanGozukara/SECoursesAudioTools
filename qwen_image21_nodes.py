@@ -1,6 +1,9 @@
 """Small gallery/canvas adapters around ComfyUI's native Qwen Image 2.1 nodes."""
 
+import base64
 import importlib
+import io
+import json
 import re
 
 import numpy as np
@@ -91,8 +94,10 @@ class SEQwenImage21Prepare:
         if references.get("videos") or references.get("audios"):
             raise ValueError("Qwen Image 2.1 accepts images only. Remove video/audio cards from the gallery.")
         entries = references.get("images", [])
+        tensors = references.get("image_tensors", [])
+        reference_count = len(entries) + len(tensors)
         has_init = init_image is not None
-        if len(entries) + int(has_init) > 10:
+        if reference_count + int(has_init) > 10:
             raise ValueError("Qwen Image 2.1 supports up to 10 images total, including the optional init canvas.")
         if mode != MODES[0] and not has_init:
             raise ValueError(f"{mode} requires an image in the optional init canvas node.")
@@ -100,7 +105,7 @@ class SEQwenImage21Prepare:
             raise ValueError("Inpaint requires a painted mask. Open the init image in Mask Editor and paint the area to change.")
         if any(int(value) < 32 or int(value) > 4096 or int(value) % 32 for value in (width, height)):
             raise ValueError("Canvas width/height must be multiples of 32 between 32 and 4096.")
-        prompt = translate_prompt(references.get("prompt", ""), len(entries), has_init)
+        prompt = translate_prompt(references.get("prompt", ""), reference_count, has_init)
         if transparent:
             prompt = "This is an RGBA image with transparency. " + prompt + " The image has alpha channel and the background is transparent."
         images = [init_image[:1]] if has_init else []
@@ -112,6 +117,7 @@ class SEQwenImage21Prepare:
                     has_alpha = "A" in source.getbands() or "transparency" in source.info
                     pixels = np.array(source.convert("RGBA" if has_alpha else "RGB"), dtype=np.float32) / 255.0
                     images.append(torch.from_numpy(pixels).unsqueeze(0))
+        images.extend(tensors)
         result = TextEncodeQwenImage21.execute(
             clip, prompt, negative_prompt, vae=vae, resolution=int(reference_resolution),
             images={f"image_{i + 1}": image for i, image in enumerate(images)},
@@ -155,7 +161,39 @@ class SEQwenImage21Finish:
         return (images * mask + canvas * (1 - mask),)
 
 
-NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in (SEQwenImage21Canvas, SEQwenImage21Prepare, SEQwenImage21Finish)}
+class SEQwenImage21SwarmInputs:
+    """Decode Swarm's ordered attachments without flattening reference alpha."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "prompt": ("STRING", {"multiline": True}),
+            "references_json": ("STRING", {"default": "[]"}),
+            "init_base64": ("STRING", {"default": ""}),
+            "mask_base64": ("STRING", {"default": ""}),
+        }}
+
+    RETURN_TYPES = ("SECOURSES_REF_PACK", "IMAGE", "MASK")
+    FUNCTION = "load"
+    CATEGORY = "SECourses/Qwen Image 2.1"
+
+    def load(self, prompt, references_json, init_base64, mask_base64):
+        def decode(value, mask=False):
+            if value.startswith("data:"):
+                value = value.split(",", 1)[1]
+            with Image.open(io.BytesIO(base64.b64decode(value, validate=True))) as source:
+                source = ImageOps.exif_transpose(source)
+                mode = "L" if mask else ("RGBA" if "A" in source.getbands() or "transparency" in source.info else "RGB")
+                pixels = np.array(source.convert(mode), dtype=np.float32) / 255.0
+            return torch.from_numpy(pixels).unsqueeze(0)
+
+        references = {"prompt": prompt, "image_tensors": [decode(value) for value in json.loads(references_json)]}
+        init = decode(init_base64) if init_base64 else None
+        mask = decode(mask_base64, mask=True) if mask_base64 else None
+        return references, init, mask
+
+
+NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in (SEQwenImage21Canvas, SEQwenImage21Prepare, SEQwenImage21Finish, SEQwenImage21SwarmInputs)}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SEQwenImage21Canvas": "Qwen 2.1 Optional Init Image + Mask",
     "SEQwenImage21Prepare": "Qwen 2.1 Gallery + Canvas",

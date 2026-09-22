@@ -1,4 +1,7 @@
 """Guard gallery numbering, optional input, and exact unmasked compositing."""
+import base64
+import io
+import json
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +16,42 @@ spec.loader.exec_module(qwen)
 
 
 class QwenImage21Tests(unittest.TestCase):
+    def test_swarm_transport_retains_alpha_and_white_edit_mask(self):
+        def encoded(mode, color):
+            buffer = io.BytesIO()
+            qwen.Image.new(mode, (64, 32), color).save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode()
+        red = encoded("RGBA", (255, 0, 0, 64))
+        blue = encoded("RGB", (0, 0, 255))
+        pack, init, mask = qwen.SEQwenImage21SwarmInputs().load(
+            "Keep @init, use @image1 then @image2", json.dumps([red, blue]), blue, encoded("L", 128))
+        self.assertEqual(pack["image_tensors"][0].shape, (1, 32, 64, 4))
+        self.assertAlmostEqual(pack["image_tensors"][0][0, 0, 0, 3].item(), 64 / 255)
+        self.assertEqual(pack["image_tensors"][1][0, 0, 0, 2].item(), 1)
+        self.assertEqual(init.shape, (1, 32, 64, 3))
+        self.assertAlmostEqual(mask[0, 0, 0].item(), 128 / 255)
+        self.assertEqual(qwen.SEQwenImage21SwarmInputs().load("text", "[]", "", ""),
+                         ({"prompt": "text", "image_tensors": []}, None, None))
+
+    def test_swarm_tensors_use_native_encoder_in_order(self):
+        init, red, blue = (torch.rand(1, 32, 64, channels) for channels in (3, 4, 3))
+        refs = {"prompt": "@init then @image1 then @image2", "image_tensors": [red, blue]}
+        args = dict(clip=None, vae=None, references=refs, mode=qwen.MODES[0], width=64, height=32,
+                    reference_resolution=0, denoise=.37, transparent=False, negative_prompt="blurry", init_image=init)
+        result = SimpleNamespace(result=([], [], {"samples": torch.zeros(1, 64, 2, 4)}))
+        with patch("comfy_extras.nodes_qwen.TextEncodeQwenImage21.execute", return_value=result) as encode:
+            output = qwen.SEQwenImage21Prepare().prepare(**args)
+            self.assertEqual(encode.call_args.args[1:3], ("<image1> then <image2> then <image3>", "blurry"))
+            self.assertEqual(encode.call_args.kwargs["resolution"], 0)
+            images = encode.call_args.kwargs["images"]
+            self.assertTrue(torch.equal(images["image_1"], init))
+            self.assertIs(images["image_2"], red)
+            self.assertIs(images["image_3"], blue)
+            self.assertEqual(output[3], 1)
+        args["references"] = {"image_tensors": [red] * 10}
+        with self.assertRaisesRegex(ValueError, "10 images total"):
+            qwen.SEQwenImage21Prepare().prepare(**args)
+
     def test_init_does_not_renumber_gallery_tokens(self):
         self.assertEqual(qwen.translate_prompt("Keep @init, add @image1 and @IMAGE2.", 2, True),
                          "Keep <image1>, add <image2> and <image3>.")

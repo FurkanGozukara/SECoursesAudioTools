@@ -92,12 +92,14 @@ class ContinuationTests(unittest.TestCase):
                 scope["mux_audio"](video, audio, output, frames / 24, frames=frames)
                 probe = json.loads(subprocess.check_output([
                     "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                    "packet=pts,duration", "-of", "json", output],
+                    "packet=pts,duration:stream=color_space,color_range", "-of", "json", output],
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
                 packets = sorted(probe["packets"], key=lambda p: p["pts"])
                 self.assertEqual(len(packets), frames)
                 step = packets[0]["duration"]
                 self.assertEqual([p["pts"] for p in packets], [i * step for i in range(frames)])
+                self.assertEqual(probe["streams"][0]["color_space"], "bt470bg")
+                self.assertEqual(probe["streams"][0]["color_range"], "tv")
 
 
 if __name__ == "__main__":

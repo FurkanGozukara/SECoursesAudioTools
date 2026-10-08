@@ -423,6 +423,7 @@ class FFmpegWriter:
             [binary, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
              "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
              "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+             "-colorspace", "bt470bg", "-color_range", "tv",
              "-movflags", "+faststart", path],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

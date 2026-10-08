@@ -1,0 +1,1449 @@
+{
+  "id": "c00492bb-06fb-45a5-a793-0fc9cbe29c3b",
+  "revision": 0,
+  "last_node_id": 911,
+  "last_link_id": 1124,
+  "nodes": [
+    {
+      "id": 115,
+      "type": "SECoursesResolutionSync",
+      "pos": [
+        1370,
+        590
+      ],
+      "size": [
+        500,
+        220
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "showAdvanced": false,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [
+            1021
+          ]
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [
+            1022
+          ]
+        }
+      ],
+      "title": "OUTPUT SIZE - aspect ratio / megapixels",
+      "properties": {
+        "Node name for S&R": "SECoursesResolutionSync"
+      },
+      "widgets_values": [
+        "Custom",
+        1.038336,
+        832,
+        1248,
+        32
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 127,
+      "type": "UNETLoader",
+      "pos": [
+        580,
+        1310
+      ],
+      "size": [
+        540,
+        130
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1064
+          ]
+        }
+      ],
+      "title": "REF2VA MODEL - gallery image / video references",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.0",
+        "Node name for S&R": "UNETLoader",
+        "models": [
+          {
+            "name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "directory": "diffusion_models"
+          }
+        ]
+      },
+      "widgets_values": [
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "default"
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 119,
+      "type": "VAELoader",
+      "pos": [
+        0,
+        1500
+      ],
+      "size": [
+        540,
+        110
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            1108
+          ]
+        }
+      ],
+      "title": "VIDEO VAE",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.0",
+        "Node name for S&R": "VAELoader",
+        "models": [
+          {
+            "name": "minimax_h3_video_vae_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+            "directory": "vae"
+          }
+        ]
+      },
+      "widgets_values": [
+        "MiniMaxH3\\minimax_h3_video_vae_int8_convrot.safetensors"
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 120,
+      "type": "VAELoader",
+      "pos": [
+        580,
+        1500
+      ],
+      "size": [
+        540,
+        110
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            1017,
+            1122
+          ]
+        }
+      ],
+      "title": "AUDIO VAE",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.0",
+        "Node name for S&R": "VAELoader",
+        "models": [
+          {
+            "name": "minimax_h3_audio_vae_fp32.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+            "directory": "vae"
+          }
+        ]
+      },
+      "widgets_values": [
+        "MiniMaxH3\\minimax_h3_audio_vae_fp32.safetensors"
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 136,
+      "type": "SECoursesMiniMaxH3Auto",
+      "pos": [
+        0,
+        2360
+      ],
+      "size": [
+        310,
+        250
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1015
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 1117
+        },
+        {
+          "name": "audio_vae",
+          "type": "VAE",
+          "link": 1017
+        },
+        {
+          "name": "references",
+          "type": "SECOURSES_REF_PACK",
+          "link": 1048
+        },
+        {
+          "name": "prompt_override",
+          "shape": 7,
+          "type": "STRING",
+          "link": 1104
+        },
+        {
+          "name": "continuation_frame",
+          "shape": 7,
+          "type": "SECOURSES_OPTIONAL_IMAGE",
+          "link": 1062
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": 1021
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": 1022
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            1119
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            1120
+          ]
+        },
+        {
+          "name": "uses_ref2va",
+          "type": "BOOLEAN",
+          "links": []
+        }
+      ],
+      "title": "MINIMAX H3 AUTO - FL2VA / REF2VA",
+      "properties": {
+        "Node name for S&R": "SECoursesMiniMaxH3Auto"
+      },
+      "widgets_values": [
+        1344,
+        768,
+        243,
+        "match"
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 400,
+      "type": "SECoursesReferenceGallery",
+      "pos": [
+        660,
+        40
+      ],
+      "size": [
+        650,
+        730
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "references",
+          "shape": 6,
+          "type": "SECOURSES_REF_PACK",
+          "links": [
+            1048,
+            1059,
+            1066,
+            1102
+          ]
+        },
+        {
+          "name": "prompt",
+          "shape": 6,
+          "type": "STRING",
+          "links": [
+            1101
+          ]
+        },
+        {
+          "name": "folder_batch_active",
+          "shape": 6,
+          "type": "BOOLEAN",
+          "links": []
+        },
+        {
+          "name": "merge_batch_videos",
+          "shape": 6,
+          "type": "BOOLEAN",
+          "links": []
+        },
+        {
+          "name": "continue_batch_with_last_frame",
+          "shape": 6,
+          "type": "BOOLEAN",
+          "links": [
+            1060
+          ]
+        },
+        {
+          "name": "continuation_context_frames",
+          "shape": 6,
+          "type": "INT",
+          "links": [
+            1099
+          ]
+        }
+      ],
+      "title": "3. SCENE + OPTIONAL IDENTITY REFERENCES",
+      "properties": {
+        "Node name for S&R": "SECoursesReferenceGallery"
+      },
+      "widgets_values": [
+        "A presenter faces the camera and speaks naturally in time with the supplied soundtrack. Preserve the identity and setting from the first image or references. Static camera, subtle natural blinking and small head movements. Clear mouth articulation. Relax during pauses. No music.",
+        "{}",
+        24,
+        15,
+        "",
+        false,
+        false,
+        "1",
+        true
+      ],
+      "color": "#514070",
+      "bgcolor": "#302844"
+    },
+    {
+      "id": 411,
+      "type": "MiniMaxH3SigmaShift",
+      "pos": [
+        0,
+        2680
+      ],
+      "size": [
+        310,
+        250
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1110
+        },
+        {
+          "name": "shift_video",
+          "type": "FLOAT",
+          "link": 1112,
+          "widget": {
+            "name": "shift_video"
+          }
+        },
+        {
+          "name": "shift_audio",
+          "type": "FLOAT",
+          "link": 1113,
+          "widget": {
+            "name": "shift_audio"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            1118
+          ]
+        }
+      ],
+      "title": "FLOW SHIFTS - VIDEO 12 / AUDIO 3 DEFAULTS",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.32.0",
+        "Node name for S&R": "MiniMaxH3SigmaShift"
+      },
+      "widgets_values": [
+        12,
+        3
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 409,
+      "type": "ComfySwitchNode",
+      "pos": [
+        350,
+        2680
+      ],
+      "size": [
+        310,
+        250
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "on_false",
+          "type": "MODEL",
+          "link": 1063
+        },
+        {
+          "name": "on_true",
+          "type": "MODEL",
+          "link": 1064
+        },
+        {
+          "name": "switch",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "switch"
+          },
+          "link": 1065
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "MODEL",
+          "links": [
+            1106
+          ]
+        }
+      ],
+      "title": "AUTO CHECKPOINT - FL2VA / REF2VA",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.0",
+        "Node name for S&R": "ComfySwitchNode"
+      },
+      "widgets_values": [
+        false
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 407,
+      "type": "SECoursesBatchContinuationFrame",
+      "pos": [
+        0,
+        3000
+      ],
+      "size": [
+        310,
+        250
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "references",
+          "type": "SECOURSES_REF_PACK",
+          "link": 1059
+        },
+        {
+          "name": "continue_batch_with_last_frame",
+          "type": "BOOLEAN",
+          "link": 1060
+        },
+        {
+          "name": "continuation_context_frames",
+          "shape": 7,
+          "type": "INT",
+          "link": 1099
+        },
+        {
+          "name": "init_image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 1098
+        }
+      ],
+      "outputs": [
+        {
+          "name": "first_frame",
+          "type": "SECOURSES_OPTIONAL_IMAGE",
+          "links": [
+            1062
+          ]
+        }
+      ],
+      "title": "INIT FRAME ROUTE - init image or previous batch frame",
+      "properties": {
+        "Node name for S&R": "SECoursesBatchContinuationFrame"
+      },
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 410,
+      "type": "SECoursesMiniMaxH3ReferenceMode",
+      "pos": [
+        350,
+        3000
+      ],
+      "size": [
+        310,
+        250
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "references",
+          "type": "SECOURSES_REF_PACK",
+          "link": 1066
+        }
+      ],
+      "outputs": [
+        {
+          "name": "has_references",
+          "type": "BOOLEAN",
+          "links": [
+            1065,
+            1109
+          ]
+        },
+        {
+          "name": "auto_route",
+          "type": "BOOLEAN",
+          "links": []
+        }
+      ],
+      "title": "CHECKPOINT MODE - current item references",
+      "properties": {
+        "Node name for S&R": "SECoursesMiniMaxH3ReferenceMode"
+      },
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 412,
+      "type": "easy loraStack",
+      "pos": [
+        1160,
+        1500
+      ],
+      "size": [
+        620,
+        310
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "optional_lora_stack",
+          "shape": 7,
+          "type": "LORA_STACK",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "links": [
+            1068
+          ]
+        }
+      ],
+      "title": "ADDITIONAL LORAS - choose files and strengths",
+      "properties": {
+        "aux_id": "FurkanGozukara/ComfyUI-Easy-Use",
+        "ver": "595e0738a9e3f8d0d9c4d875461b2d2c9e7559c7",
+        "Node name for S&R": "easy loraStack",
+        "cnr_id": "comfyui-easy-use"
+      },
+      "widgets_values": [
+        true,
+        "simple",
+        2,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1,
+        "None",
+        1,
+        1,
+        1
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 413,
+      "type": "easy loraStackApply",
+      "pos": [
+        700,
+        3000
+      ],
+      "size": [
+        310,
+        250
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "lora_stack",
+          "type": "LORA_STACK",
+          "link": 1068
+        },
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1106
+        },
+        {
+          "name": "optional_clip",
+          "shape": 7,
+          "type": "CLIP",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            1107
+          ]
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "slot_index": 1,
+          "links": []
+        }
+      ],
+      "title": "APPLY OPTIONAL LORAS",
+      "properties": {
+        "aux_id": "FurkanGozukara/ComfyUI-Easy-Use",
+        "ver": "595e0738a9e3f8d0d9c4d875461b2d2c9e7559c7",
+        "Node name for S&R": "easy loraStackApply",
+        "cnr_id": "comfyui-easy-use"
+      },
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 408,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        1310
+      ],
+      "size": [
+        540,
+        130
+      ],
+      "flags": {},
+      "order": 28,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1063
+          ]
+        }
+      ],
+      "title": "FL2VA MODEL - audio + text / image",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.0",
+        "Node name for S&R": "UNETLoader",
+        "models": [
+          {
+            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "directory": "diffusion_models"
+          }
+        ]
+      },
+      "widgets_values": [
+        "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "default"
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 128,
+      "type": "CLIPLoader",
+      "pos": [
+        1160,
+        1310
+      ],
+      "size": [
+        620,
+        130
+      ],
+      "flags": {},
+      "order": 29,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            1015
+          ]
+        }
+      ],
+      "title": "TEXT ENCODER - shared by both H3 modes",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.30.0",
+        "Node name for S&R": "CLIPLoader",
+        "models": [
+          {
+            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "directory": "text_encoders"
+          }
+        ]
+      },
+      "widgets_values": [
+        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "minimax",
+        "default"
+      ],
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 427,
+      "type": "SECoursesOptionalImage",
+      "pos": [
+        0,
+        720
+      ],
+      "size": [
+        600,
+        370
+      ],
+      "flags": {},
+      "order": 32,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            1098,
+            1103
+          ]
+        }
+      ],
+      "title": "2. OPTIONAL IMAGE - none = audio + text",
+      "properties": {
+        "Node name for S&R": "SECoursesOptionalImage"
+      },
+      "widgets_values": [
+        "h3_lip_synch_turbo4_672x1216_demo.png",
+        "image"
+      ],
+      "color": "#195564",
+      "bgcolor": "#173841"
+    },
+    {
+      "id": 423,
+      "type": "SECoursesInitAudio",
+      "pos": [
+        0,
+        300
+      ],
+      "size": [
+        600,
+        350
+      ],
+      "flags": {},
+      "order": 33,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "duration_seconds",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration_seconds"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "init_audio",
+          "type": "AUDIO",
+          "links": [
+            1121
+          ]
+        },
+        {
+          "name": "duration_seconds",
+          "type": "FLOAT",
+          "links": []
+        }
+      ],
+      "title": "1. FULL SOUNDTRACK - duration follows this audio",
+      "properties": {
+        "Node name for S&R": "SECoursesInitAudio"
+      },
+      "widgets_values": [
+        "h3_lip_synch_turbo4_672x1216_demo.wav",
+        5,
+        "match init audio length",
+        0,
+        0
+      ],
+      "color": "#195564",
+      "bgcolor": "#173841"
+    },
+    {
+      "id": 501,
+      "type": "SEH3LipSyncPrompt",
+      "pos": [
+        660,
+        850
+      ],
+      "size": [
+        650,
+        300
+      ],
+      "flags": {},
+      "order": 37,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "scene",
+          "type": "STRING",
+          "link": 1101
+        },
+        {
+          "name": "references",
+          "type": "SECOURSES_REF_PACK",
+          "link": 1102
+        },
+        {
+          "name": "first_frame",
+          "type": "IMAGE",
+          "link": 1103
+        }
+      ],
+      "outputs": [
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "links": [
+            1104
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SEH3LipSyncPrompt"
+      },
+      "widgets_values": [
+        "speech",
+        "",
+        "English"
+      ],
+      "title": "OPTIONAL TRANSCRIPT / LYRICS - exact words from your audio",
+      "color": "#26343f",
+      "bgcolor": "#16232d"
+    },
+    {
+      "id": 502,
+      "type": "SEH3LipSyncTurbo",
+      "pos": [
+        1370,
+        40
+      ],
+      "size": [
+        500,
+        500
+      ],
+      "flags": {},
+      "order": 38,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1107
+        },
+        {
+          "name": "video_vae",
+          "type": "VAE",
+          "link": 1108
+        },
+        {
+          "name": "uses_ref2va",
+          "type": "BOOLEAN",
+          "link": 1109
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1110
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "steps",
+          "type": "INT",
+          "links": [
+            1124
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "video_shift",
+          "type": "FLOAT",
+          "links": [
+            1112
+          ],
+          "slot_index": 2
+        },
+        {
+          "name": "audio_shift",
+          "type": "FLOAT",
+          "links": [
+            1113
+          ],
+          "slot_index": 3
+        },
+        {
+          "name": "video_vae",
+          "type": "VAE",
+          "links": [
+            1117,
+            1123
+          ],
+          "slot_index": 4
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SEH3LipSyncTurbo"
+      },
+      "widgets_values": [
+        true,
+        "4",
+        50,
+        1.0,
+        false,
+        false,
+        true,
+        true,
+        true,
+        "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors",
+        "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+        "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+      ],
+      "title": "4. TURBO / NATIVE SOL / CACHE - independent switches",
+      "color": "#735529",
+      "bgcolor": "#3b3020"
+    },
+    {
+      "id": 910,
+      "type": "SEH3LongLipSync",
+      "pos": [
+        1950,
+        40
+      ],
+      "size": [
+        670,
+        580
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1118
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 1119
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 1120
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 1121
+        },
+        {
+          "name": "audio_vae",
+          "type": "VAE",
+          "link": 1122
+        },
+        {
+          "name": "video_vae",
+          "type": "VAE",
+          "link": 1123
+        },
+        {
+          "name": "steps",
+          "type": "INT",
+          "link": 1124,
+          "widget": {
+            "name": "steps"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        },
+        {
+          "name": "video_path",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "5. LONG LIP SYNC - automatically uses the whole audio",
+      "properties": {
+        "Node name for S&R": "SEH3LongLipSync"
+      },
+      "widgets_values": [
+        20261008,
+        "fixed",
+        4,
+        "243",
+        "39",
+        "video/H3_Long_Lip_Sync/Avatar",
+        17
+      ],
+      "color": "#285b43",
+      "bgcolor": "#1b352a"
+    },
+    {
+      "id": 911,
+      "type": "MarkdownNote",
+      "pos": [
+        1950,
+        720
+      ],
+      "size": [
+        670,
+        380
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "START HERE - audio-driven latent continuation",
+      "properties": {},
+      "widgets_values": [
+        "Upload your full audio and a portrait, describe the scene, then Run. The sampler automatically creates overlapping H3 windows and exports one 24 FPS video at the audio duration.\n\n**243 frames / 39 overlap** is the tested default. No repeated pixel re-encoding; held latents are preserved. This reduces one source of drift, but does not guarantee unlimited identity retention or perfect lip sync.\n\n**SOL** is optional native ComfyUI attention. The Turbo control protects the first/final step. **FirstBlockCache** is a separate approximate switch; leave it off for quality comparisons. Use 512x768 for faster drafts or 832x1248 for detail.\n\nRequires current ComfyUI, comfy-kitchen >=0.2.37, SECoursesAudioTools and ComfyUI-TeaCache. Read the output JSON for window boundaries and timings."
+      ]
+    }
+  ],
+  "links": [
+    [
+      1015,
+      128,
+      0,
+      136,
+      0,
+      "CLIP"
+    ],
+    [
+      1017,
+      120,
+      0,
+      136,
+      2,
+      "VAE"
+    ],
+    [
+      1021,
+      115,
+      0,
+      136,
+      6,
+      "INT"
+    ],
+    [
+      1022,
+      115,
+      1,
+      136,
+      7,
+      "INT"
+    ],
+    [
+      1048,
+      400,
+      0,
+      136,
+      3,
+      "SECOURSES_REF_PACK"
+    ],
+    [
+      1059,
+      400,
+      0,
+      407,
+      0,
+      "SECOURSES_REF_PACK"
+    ],
+    [
+      1060,
+      400,
+      4,
+      407,
+      1,
+      "BOOLEAN"
+    ],
+    [
+      1062,
+      407,
+      0,
+      136,
+      5,
+      "SECOURSES_OPTIONAL_IMAGE"
+    ],
+    [
+      1063,
+      408,
+      0,
+      409,
+      0,
+      "MODEL"
+    ],
+    [
+      1064,
+      127,
+      0,
+      409,
+      1,
+      "MODEL"
+    ],
+    [
+      1065,
+      410,
+      0,
+      409,
+      2,
+      "BOOLEAN"
+    ],
+    [
+      1066,
+      400,
+      0,
+      410,
+      0,
+      "SECOURSES_REF_PACK"
+    ],
+    [
+      1068,
+      412,
+      0,
+      413,
+      0,
+      "LORA_STACK"
+    ],
+    [
+      1098,
+      427,
+      0,
+      407,
+      3,
+      "IMAGE"
+    ],
+    [
+      1099,
+      400,
+      5,
+      407,
+      2,
+      "INT"
+    ],
+    [
+      1101,
+      400,
+      1,
+      501,
+      0,
+      "STRING"
+    ],
+    [
+      1102,
+      400,
+      0,
+      501,
+      1,
+      "SECOURSES_REF_PACK"
+    ],
+    [
+      1103,
+      427,
+      0,
+      501,
+      2,
+      "IMAGE"
+    ],
+    [
+      1104,
+      501,
+      0,
+      136,
+      4,
+      "STRING"
+    ],
+    [
+      1106,
+      409,
+      0,
+      413,
+      1,
+      "MODEL"
+    ],
+    [
+      1107,
+      413,
+      0,
+      502,
+      0,
+      "MODEL"
+    ],
+    [
+      1108,
+      119,
+      0,
+      502,
+      1,
+      "VAE"
+    ],
+    [
+      1109,
+      410,
+      0,
+      502,
+      2,
+      "BOOLEAN"
+    ],
+    [
+      1110,
+      502,
+      0,
+      411,
+      0,
+      "MODEL"
+    ],
+    [
+      1112,
+      502,
+      2,
+      411,
+      1,
+      "FLOAT"
+    ],
+    [
+      1113,
+      502,
+      3,
+      411,
+      2,
+      "FLOAT"
+    ],
+    [
+      1117,
+      502,
+      4,
+      136,
+      1,
+      "VAE"
+    ],
+    [
+      1118,
+      411,
+      0,
+      910,
+      0,
+      "MODEL"
+    ],
+    [
+      1119,
+      136,
+      0,
+      910,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      1120,
+      136,
+      1,
+      910,
+      2,
+      "LATENT"
+    ],
+    [
+      1121,
+      423,
+      0,
+      910,
+      3,
+      "AUDIO"
+    ],
+    [
+      1122,
+      120,
+      0,
+      910,
+      4,
+      "VAE"
+    ],
+    [
+      1123,
+      502,
+      4,
+      910,
+      5,
+      "VAE"
+    ],
+    [
+      1124,
+      502,
+      1,
+      910,
+      6,
+      "INT"
+    ]
+  ],
+  "groups": [],
+  "definitions": {},
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.68,
+      "offset": [
+        60,
+        50
+      ]
+    },
+    "frontendVersion": "1.49.6",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "workflowRendererVersion": "LG"
+  },
+  "version": 0.4
+}

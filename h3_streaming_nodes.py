@@ -412,12 +412,13 @@ class StreamingAttention:
 # ---------------------------------------------------------------------------
 
 class FFmpegWriter:
-    def __init__(self, path, width, height, fps=FPS, crf=18, preset="medium"):
+    def __init__(self, path, width, height, fps=FPS, crf=18, preset="medium", frame_limit=None):
         binary = shutil.which("ffmpeg")
         if binary is None:
             raise RuntimeError("ffmpeg is not on PATH; it is required to save the streamed video")
         self.path = path
         self.frames = 0
+        self.frame_limit = frame_limit
         self.process = subprocess.Popen(
             [binary, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
              "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
@@ -428,6 +429,10 @@ class FFmpegWriter:
 
     def write(self, frames_uint8):
         # frames_uint8: [T, H, W, 3] uint8 on CPU
+        if self.frame_limit is not None:
+            frames_uint8 = frames_uint8[:max(0, self.frame_limit - self.frames)]
+        if not len(frames_uint8):
+            return
         if self.process.poll() is not None:
             raise RuntimeError("ffmpeg exited early: " + self.process.stderr.read().decode(errors="replace"))
         self.process.stdin.write(frames_uint8.contiguous().numpy().tobytes())
@@ -437,6 +442,7 @@ class FFmpegWriter:
         if self.process.stdin:
             self.process.stdin.close()
         error = self.process.stderr.read().decode(errors="replace")
+        self.process.stderr.close()
         code = self.process.wait()
         if code != 0:
             raise RuntimeError(f"ffmpeg video encode failed ({code}): {error}")

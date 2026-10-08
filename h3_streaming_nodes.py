@@ -191,9 +191,9 @@ def normalize_waveform(audio, sample_rate):
         waveform = waveform.mean(dim=0, keepdim=True)
     source_rate = int(audio["sample_rate"])
     if source_rate != int(sample_rate):
-        import torchaudio
+        import comfy.audio
 
-        waveform = torchaudio.functional.resample(waveform, source_rate, int(sample_rate))
+        waveform = comfy.audio.resample(waveform, source_rate, int(sample_rate))
     if waveform.shape[0] == 1:
         waveform = waveform.expand(2, -1)
     return waveform.contiguous()

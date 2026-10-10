@@ -76,6 +76,19 @@ def window_conditioning(positive, encoded_audio, continuation):
     return result
 
 
+class MouthPassWriter:
+    """Restores the mouth of every decoded uint8 chunk before the encoder receives it."""
+
+    def __init__(self, writer, mouth):
+        self.writer, self.mouth = writer, mouth
+
+    def write(self, frames_uint8):
+        return self.writer.write(self.mouth.process(frames_uint8.contiguous().clone()))
+
+    def __getattr__(self, name):
+        return getattr(self.writer, name)
+
+
 class SEH3LongLipSync:
     @classmethod
     def INPUT_TYPES(cls):
@@ -92,6 +105,12 @@ class SEH3LongLipSync:
             "overlap_frames": (["39", "90"], {"tooltip": "39 = 1.625 seconds held exactly in latent space at every join. 90 = 3.75 seconds, slower with more context."}),
             "filename_prefix": ("STRING", {"default": "video/H3_Long_Lip_Sync/Avatar"}),
             "video_crf": ("INT", {"default": 17, "min": 0, "max": 40}),
+        }, "optional": {
+            "mouth_pass": ("BOOLEAN", {"default": False, "tooltip": "Aligned CodeFormer mouth-only restoration of every decoded chunk before encoding. Off keeps the original frames."}),
+            "mouth_fidelity": ("FLOAT", {"default": .9, "min": 0, "max": 1, "step": .01, "tooltip": "CodeFormer fidelity; 0.9 is the tested recipe."}),
+            "mouth_blend": ("FLOAT", {"default": .7, "min": 0, "max": 1, "step": .01, "tooltip": "Feathered mouth-only blend. 0 leaves every frame unchanged."}),
+            "mouth_model": ("STRING", {"default": "codeformer.pth", "tooltip": "Existing file under models/facerestore_models. No automatic download."}),
+            "mouth_detector": ("STRING", {"default": "models/buffalo_l/det_10g.onnx", "tooltip": "Existing SCRFD detector under models/insightface. No automatic download."}),
         }}
 
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
@@ -103,7 +122,15 @@ class SEH3LongLipSync:
                    "Avoids repeated pixel re-encoding. It reduces one source of drift; it does not guarantee indefinite identity or perfect lip sync.")
 
     def generate(self, model, positive, latent, audio, audio_vae, video_vae, seed, steps,
-                 window_frames="243", overlap_frames="39", filename_prefix="video/H3_Long_Lip_Sync/Avatar", video_crf=17):
+                 window_frames="243", overlap_frames="39", filename_prefix="video/H3_Long_Lip_Sync/Avatar", video_crf=17,
+                 mouth_pass=False, mouth_fidelity=.9, mouth_blend=.7,
+                 mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx"):
+        mouth_pass = bool(mouth_pass) and mouth_blend != 0
+        if mouth_pass:
+            # Fail before sampling, not after a long generation, when a mouth model is missing.
+            from .codeformer_mouth import model_path
+            model_path("facerestore_models", mouth_model)
+            model_path("insightface", mouth_detector)
         if type(model.get_model_object("diffusion_model")).__name__ != "MiniMaxH3Model":
             raise ValueError("H3 Long Lip Sync requires a native MiniMax H3 model")
         from comfy.ldm.minimax import model as h3
@@ -177,7 +204,11 @@ class SEH3LongLipSync:
         # can drop a final B-frame while retaining a later presentation time.
         writer = FFmpegWriter(base + ".video_only.mp4", width, height, FPS, crf=int(video_crf),
                               frame_limit=math.ceil(seconds * FPS))
-        decoder = IncrementalH3Decoder(video_vae, total_steps, writer)
+        mouth = None
+        if mouth_pass:
+            from .codeformer_mouth import CodeFormerMouth
+            mouth = CodeFormerMouth(mouth_model, mouth_detector, mouth_fidelity, mouth_blend)
+        decoder = IncrementalH3Decoder(video_vae, total_steps, writer if mouth is None else MouthPassWriter(writer, mouth))
         try:
             decoder.decode(video, total_steps, final=True)
             writer.close()
@@ -190,6 +221,7 @@ class SEH3LongLipSync:
         report["timing"]["total_seconds"] = time.perf_counter() - start_all
         report["raw_frames"] = decoder.frames_written
         report["output_frames"] = math.ceil(seconds * FPS)
+        report["mouth_pass"] = mouth.report if mouth is not None else {"enabled": False}
         report["soundtrack"] = {"source": "complete driving audio, unchanged timing",
                                "intermediate": f"{rate} Hz normalized PCM WAV",
                                "output_codec": "AAC", "lossless_copy": False}

@@ -48,3 +48,33 @@ class CodeFormerVideoTests(TestCase):
         expected = before.clone()
         expected[:, 1, 2] = .8
         self.assertTrue(torch.equal(output.images, expected))
+
+
+class CodeFormerImagesTests(TestCase):
+    def test_disabled_returns_the_same_frames_without_loading_models(self):
+        images = torch.rand(3, 4, 5, 3)
+        with patch.object(cn, "CodeFormerMouth", side_effect=AssertionError("must not load")):
+            self.assertIs(cn.SECodeFormerMouthImages().restore(images, enabled=False)[0], images)
+            self.assertIs(cn.SECodeFormerMouthImages().restore(images, mouth_blend=0)[0], images)
+
+    def test_only_restored_pixels_change_and_alpha_is_kept(self):
+        images = torch.full((19, 4, 5, 4), .123456)
+        before = images.clone()
+        counts = []
+
+        class Mouth:
+            report = {"test": True}
+
+            def process(self, frames):
+                counts.append(len(frames))
+                frames[:, 1, 2] = 204
+                return frames
+
+        with patch.object(cn, "CodeFormerMouth", return_value=Mouth()) as factory:
+            output = cn.SECodeFormerMouthImages().restore(images, fidelity=.8, mouth_blend=.6)[0]
+        factory.assert_called_once_with("codeformer.pth", "models/buffalo_l/det_10g.onnx", .8, .6)
+        self.assertEqual(counts, [16, 3])
+        self.assertTrue(torch.equal(images, before))
+        expected = before.clone()
+        expected[:, 1, 2, :3] = .8
+        self.assertTrue(torch.equal(output, expected))

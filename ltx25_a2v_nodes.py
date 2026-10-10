@@ -565,6 +565,23 @@ _FACE_APP = {"app": None, "tried": False}
 _MASK_CACHE = {}  # sha256 of the input image -> (mask, note); batches reuse the same few images hundreds of times
 
 
+def _insightface_detector_root():
+    """InsightFace folder whose models/buffalo_l holds det_10g.onnx: ComfyUI's own models/insightface, every
+    registered insightface folder, then the insightface folders next to the configured model roots (Swarm's shared
+    Models folder, extra_model_paths.yaml), as the CodeFormer mouth pass searches. None keeps the Haar cascade."""
+    roots = [os.path.join(folder_paths.models_dir, "insightface")]
+    for key in ("insightface", "diffusion_models", "checkpoints"):
+        try:
+            paths = folder_paths.get_folder_paths(key)
+        except Exception:
+            continue
+        roots += paths if key == "insightface" else [os.path.join(os.path.dirname(p), "insightface") for p in paths]
+    for root in roots:
+        if os.path.isfile(os.path.join(root, "models", "buffalo_l", "det_10g.onnx")):
+            return root
+    return None
+
+
 def _face_app():
     """insightface detector, created once per process (loading the ONNX models every call cost ~1 s per job)."""
     if _FACE_APP["tried"]:
@@ -573,8 +590,8 @@ def _face_app():
     try:
         from insightface.app import FaceAnalysis  # optional, better detector
 
-        root = os.path.join(folder_paths.models_dir, "insightface")
-        if os.path.isdir(os.path.join(root, "models", "buffalo_l")):
+        root = _insightface_detector_root()
+        if root is not None:
             app = FaceAnalysis(name="buffalo_l", root=root, providers=["CPUExecutionProvider"], allowed_modules=["detection"])
             app.prepare(ctx_id=-1, det_size=(640, 640))
             _FACE_APP["app"] = app

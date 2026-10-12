@@ -5,6 +5,10 @@ import threading
 
 import torch
 
+from .musubi_lora_keys import install as _install_musubi_lora_keys
+
+_install_musubi_lora_keys()
+
 from .qwen_image21_nodes import (
     NODE_CLASS_MAPPINGS as QWEN21_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as QWEN21_NODE_DISPLAY_NAME_MAPPINGS,

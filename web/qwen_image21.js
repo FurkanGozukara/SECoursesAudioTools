@@ -86,20 +86,36 @@ function watchMaskEditor() {
 
 // Reuse the installed gallery; this opt-in profile only hides video controls.
 function configure(node) {
-    if (!node.properties?.qwen21_images_only || !node.__refGallery) return;
+    if (!(node.properties?.qwen21_images_only || node.properties?.flux3_images_only) || !node.__refGallery) return;
     const ui = node.__refGallery;
+    const flux3 = node.properties.flux3_images_only;
     if (!ui.qwen21ProfileInstalled) {
         ui.qwen21ProfileInstalled = true;
         const render = ui.render.bind(ui);
         ui.render = () => {
             render();
-            ui.counter.textContent = `${ui.state.images.length} images (10 total incl. init)`;
+            ui.counter.textContent = flux3
+                ? `${ui.state.images.length} / 10 reference images`
+                : `${ui.state.images.length} images (10 total incl. init)`;
             ui.soundtrackHint.style.setProperty("display", "none", "important");
         };
     }
     ui.fileInput.accept = "image/*";
     ui.addButton.textContent = "+ Add reference images";
-    ui.addButton.title = "Add, paste, remove or reorder images. Up to 10 total, including the optional init canvas.";
+    ui.addButton.title = flux3
+        ? "Add, paste, remove or reorder up to 10 images. Empty gallery = text to image."
+        : "Add, paste, remove or reorder images. Up to 10 total, including the optional init canvas.";
+    if (flux3) {
+        ui.root.classList.add("secourses-flux3-gallery");
+        // Keep batch prompts and larger galleries inside the preset's panel.
+        ui.minContentHeight = () => 360;
+        ui.cardsWrap.style.maxHeight = "128px";
+        ui.root.style.overflowY = "auto";
+        ui.empty.textContent = "Optional images: add, drop or paste. Leave empty for text to image.";
+        // The FLUX.3 adapter resolves all prompts with the shared seed, including
+        // inline additions and folder text files that frontend expansion misses.
+        ui.promptWidget.serializeValue = () => ui.promptWidget.value;
+    }
     ui.soundtrackHint.style.setProperty("display", "none", "important");
     ui.trimToggle.style.display = "none";
     ui.continuationRow.style.display = "none";

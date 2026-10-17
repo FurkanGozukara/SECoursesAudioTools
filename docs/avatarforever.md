@@ -52,32 +52,41 @@ An ordinary LTX-2.3 checkpoint is not a substitute for AvatarForever's training.
 Use matching LTX-2.3 encoders/VAEs; do not silently substitute LTX-2.5/Gemma 4.
 
 The native Comfy loader logs three “unexpected” channel-condition tensors; this
-adapter reads and uses those exact three tensors separately. This is expected
-with this loader. Using the ordinary UNET loader alone would omit them.
+adapter reads those exact three tensors separately. This is expected with this
+loader. The current public checkpoint and its local INT8 conversion have an
+all-zero projection (also reported in [upstream issue 5](https://github.com/leeruibin/avatarforever/issues/5)).
+The loader now reports that limitation without changing the generation path. The
+first-frame image still conditions generation. Nonzero channel weights remain
+supported; they are not replaced, synthesized or modified.
 
-## Controls and defaults
+## Controls and preset settings
+
+The unified presets use the tested singing-demo settings below. Existing saved
+graphs keep their values; the node itself retains the released chunk-size default
+of 4 for compatibility and lower memory use.
 
 | Controls | Meaning / default |
 |---|---|
-| Width, Height, Match Image Aspect | 768×512 pixel budget; image aspect matching on |
+| Width, Height, Match Image Aspect | 512×768 exact canvas; image aspect matching off |
 | FPS | 25, the released recipe; changing it also changes the AV timeline |
 | Seed | 42 in the preset, fixed; choose another for variation |
 | Use Image, Image Strength | On, 1.0; strength affects first-frame latent conditioning |
 | Image Compression | 0, disabled; optional native LTX image preprocessing |
 | Audio Start, Duration, Lead In | 0, 0, 0; start at beginning, full recording, no lead-in |
 | Sigmas | `1.0, 0.98125, 0.909375, 0.421875, 0.0` |
-| Chunk Size | 4 video latent frames, approximately 1.28s after the first chunk |
+| Chunk Size | 16 video latent frames in the presets; 4 remains the node default. Larger chunks use more memory |
 | History Chunks | 1 previous chunk; -1 retains all and grows memory with duration |
 | Sink First Chunk | On; retain the initial chunk alongside recent history |
 | Relative Positions | On; compact the selected history's time positions |
 | ForeverCache | Off, matching released CLI; approximate per-chunk feature reuse |
 | Cache Device | Auto; GPU when the estimated budget fits, otherwise system RAM |
-| Channel Condition, Mode | On, gated; learned identity condition on each new chunk |
+| Channel Condition, Mode | On, gated; ineffective with the public checkpoint's zero projection |
 | First Frame Prefix, Position | Off, prepend; also supports append |
 | Resident Weights | On; native non-dynamic loading, useful for this large INT8 model |
 | Tiled VAE | On; spatial tiling; temporal decoding is bounded even when this is off |
 | Spatial Tile / Overlap | 512 / 64 pixels; overlap is constrained below tile size |
 | Temporal Tile / Overlap | 128 / 32 frames; overlap is constrained below tile size |
+| Live Preview | Auto; predicted frame after each denoising step, including step 1. Latent or off are also available |
 | CRF / Encoding Preset | 17 / fast; export quality and compression speed |
 | Mouth Enhancement | On in both unified presets; off preserves original decoded frames |
 | Mouth Fidelity / Blend | 0.9 / 0.7; CodeFormer fidelity and feathered mouth blend are separate controls |
@@ -97,11 +106,11 @@ reported instead of silently switching detection to CPU. The output JSON include
 the selected devices and restoration timings. Old API graphs that omit the new
 optional inputs retain their original behavior.
 
-Image strength and channel conditioning are different controls. Reducing image
-strength while leaving channel conditioning enabled still supplies the portrait
-as an identity condition throughout the video. To remove image influence, turn
-Use Image off. Without an image, channel conditioning comes from the first
-generated latent frame.
+Image strength and channel conditioning are different controls. For checkpoints
+with nonzero channel weights, channel conditioning supplies the portrait as an
+identity condition throughout the video; without an image it uses the first
+generated latent frame. The current public checkpoint's zero projection makes
+that extra branch ineffective. To remove image influence, turn Use Image off.
 
 First Frame Prefix only activates when chunk 0 is absent from the selected
 history. With Sink First Chunk on it normally has no effect. To experiment with
@@ -154,6 +163,69 @@ prompt, Video Frames, refiner and unrelated pipeline controls are bypassed.
 Swarm uses the same Python sampler. The C# extension only registers parameters
 and builds its graph, before the ordinary loader can choose/download fallbacks.
 Turning AvatarForever Enabled off returns to the normal Swarm workflow.
+
+## Live preview, 2026-10-17
+
+The sampler now sends the newest predicted video frame through ComfyUI's native
+preview transport after each denoising step. The first preview arrives at step 1;
+model loading, text/audio encoding and that first step must still finish first.
+This is a sequence of approximate still previews, not an audio/video stream.
+The final playable MP4 continues to appear after decoding and export.
+
+`live_preview = auto` uses an already-installed `taeltx2_3.safetensors` from
+`vae_approx` or `vae`, on CPU. It decodes a single frame at its native latent
+resolution and then reduces the RGB preview to at most 512 pixels. Resizing the
+packed latent before decoding caused face distortion and is not used. No preview
+model is downloaded. A missing or unreadable tiny VAE falls back to native latent
+RGB; `latent` selects that fast coarse view directly, and `off` disables previews.
+Preview time and first-preview latency are recorded separately in the JSON report.
+The preview decoder adds no GPU model weights, but prediction creates temporary
+GPU tensors. Its peak VRAM overhead has not been measured; `off` avoids it.
+
+The input is appended to the optional inputs and defaults to auto. Existing
+Comfy workflows and SwarmUI AvatarForever 1.0.3 graphs that omit it remain valid
+and receive live previews. Socket types, required inputs and final outputs are
+unchanged. The full video VAE and mouth enhancement still run only for export;
+mouth restoration changes detail, not lip timing.
+
+## Closed-mouth investigation and tested recipe, 2026-10-17
+
+The supplied singing demo stayed mostly closed-mouthed with the earlier settings.
+Its exported soundtrack was present and aligned: the measured audio delay was
+zero, with 0.99898 correlation against the source after AAC encoding. Changing
+only the prompt did not fix it. Increasing audio level by 9 dB also failed in a
+six-second control; no automatic gain change was introduced.
+
+At 512×768, a controlled six-second comparison with the same portrait, soundtrack,
+prompt and seed showed closed lips with chunk size 4 and visible articulation
+with chunk size 16. The complete 18.048-second soundtrack then produced sustained
+mouth movement at 512×768 with 16-frame chunks, both with and without mouth
+enhancement. At 1024×1024, the full clip remained mostly closed-mouthed even with
+16-frame chunks. The presets now use the tested 512×768 exact canvas and chunk
+size 16, keeping the four-step schedule, seed and other generation controls.
+This is a tested workaround for this demo, not proof of a universal lip-sync fix.
+Phoneme-level synchronization has not been measured. Inspect a short sample when
+changing the image, soundtrack, native resolution or chunk size. A separate
+speech control produced mouth movement with chunk size 4; four-frame chunks are
+not universally broken. Similar input-dependent failures are reported in
+[upstream issue 9](https://github.com/leeruibin/avatarforever/issues/9).
+
+The custom forward was compared with the released implementation on CPU using
+two transformer blocks, nonzero channel weights, contiguous and separated time
+positions: maximum absolute difference 9.54e-7. That verifies adapter math, not
+whole-model equivalence. The public BF16 checkpoint and the local INT8 conversion
+both contain zero channel-conditioning tensors, so those controls cannot supply
+the advertised continuing identity reinforcement with these weights.
+
+Validation: 60 node-pack tests passed; an old SwarmUI 1.0.3 preset rendered through
+the real Swarm WebSocket route, delivered eight live previews and a final MP4,
+without a new extension parameter. The complete 452-frame portrait MP4 was
+byte-identical with previews enabled and disabled (SHA-256
+`739529dcd20a7e874044a33d2b8c2286e2d5bfa1220a228dcfaf1e55cb68b4e3`).
+The enhanced full clip saved 452 video frames at 25 fps and the complete 18.048s
+soundtrack. Its first preview took 6.53s from sampler entry in a warm session;
+loading/queue time is additional. These runs shared physical GPU 0 with another
+workload and used model offloading, so their durations are not speed benchmarks.
 
 ## Initial validation on 2026-09-20 (speed measurements superseded below)
 
@@ -233,15 +305,12 @@ The BF16 reference required approximately 11.3 GiB of model offloading on this
 at the same resolution. Its setup was cold, so use the DiT column when comparing
 sampling cost. This short test is not a general proof of quantization equivalence.
 
-Recommended changes for facial detail: keep INT8, the four-step schedule, image
-strength 1, gated channel conditioning and the sink; use a 768×1152 portrait or
-1152×768 landscape pixel budget and CRF 12. This increases generated pixel count
-by 2.25×. The extracted higher-resolution frame shows more resolved beard/hair
-and clothing detail, although no claim of matching all official examples is made.
-CRF 12 reduces compression loss; it cannot create missing skin detail by itself.
-A tighter input portrait can allocate more pixels to the face at the same render
-cost, but changes the composition. Increase resolution if the original composition
-must be retained. Do not increase steps blindly on this four-step distilled model.
+The historical higher-native-resolution recommendation is superseded by the
+2026-10-17 quality investigation above. Those earlier detail comparisons showed
+more resolved hair and clothing but did not establish working lip synchronization.
+Start with the currently tested native size and inspect articulation before
+increasing it. CRF 12 reduces compression loss; it cannot create missing skin
+detail or lip motion. Do not increase steps blindly on this four-step distilled model.
 
 ForeverCache did not deliver an end-to-end speed improvement in this 5090 test;
 keep it off by default. A larger temporal tile with spatial tiling disabled was

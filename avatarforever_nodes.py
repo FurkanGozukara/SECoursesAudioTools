@@ -1,6 +1,7 @@
 """Native AvatarForever image + audio / text + audio streaming nodes."""
 
 import json
+import logging
 import math
 import os
 import time
@@ -10,8 +11,10 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 import comfy.model_management as mm
+import comfy.sd
 import comfy.utils
 import folder_paths
+import latent_preview
 import nodes
 from comfy_api.latest import InputImpl
 from comfy_extras.nodes_audio import VAEEncodeAudio
@@ -21,6 +24,49 @@ from .h3_streaming_nodes import FFmpegWriter, mux_audio, write_wav
 
 SIGMAS = "1.0, 0.98125, 0.909375, 0.421875, 0.0"
 DEFAULT_MODEL = "avatarforever-ltx-2.3-22b-INT8-ConvRot-HQ.safetensors"
+
+
+class AvatarPreview:
+    """Preview the newest predicted frame without loading the full video VAE."""
+
+    def __init__(self, method, latent_format):
+        self.vae = None
+        self.method = "latent"
+        if method == "auto":
+            for category in ("vae_approx", "vae"):
+                name = next((n for n in folder_paths.get_filename_list(category)
+                             if os.path.basename(n) == "taeltx2_3.safetensors"), None)
+                if name is not None:
+                    try:
+                        path = folder_paths.get_full_path_or_raise(category, name)
+                        self.vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(path),
+                                               device=torch.device("cpu"), dtype=torch.float32)
+                        self.vae.first_stage_model.show_progress_bar = False
+                        self.method = "taeltx2_3"
+                    except (OSError, RuntimeError, ValueError, KeyError) as error:
+                        self.vae = None
+                        logging.warning("[AvatarForever] Tiny preview unavailable; using latent RGB: %s", error)
+                    break
+        self.rgb = latent_preview.Latent2RGBPreviewer(latent_format.latent_rgb_factors,
+                                                      latent_format.latent_rgb_factors_bias)
+
+    def decode(self, prediction):
+        # Frame zero is the fixed portrait; show the newest generated frame.
+        frame = prediction[:1, :, -1:].detach().float().cpu()
+        if self.vae is None:
+            return self.rgb.decode_latent_to_preview_image("JPEG", frame)
+        # Resize RGB, never the packed LTX latent: latent interpolation distorts faces.
+        try:
+            pixels = self.vae.decode(frame)
+        except (OSError, RuntimeError, ValueError) as error:
+            logging.warning("[AvatarForever] Tiny preview failed; using latent RGB: %s", error)
+            self.vae = None
+            self.method = "latent"
+            return self.rgb.decode_latent_to_preview_image("JPEG", frame)
+        pixels = pixels.reshape(-1, *pixels.shape[-3:])[-1]
+        preview_image = latent_preview.preview_to_image(pixels, do_scale=False)
+        preview_image.thumbnail((512, 512))
+        return "JPEG", preview_image, 512
 
 
 def chunk_plan(total, audio_steps, chunk_size):
@@ -109,7 +155,7 @@ class SEAvatarForeverLoader:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load"
     CATEGORY = "SECourses/AvatarForever"
-    DESCRIPTION = "Native LTX loader plus the checkpoint's three trained AvatarForever channel-conditioning tensors. No downloads."
+    DESCRIPTION = "Native LTX loader plus the checkpoint's AvatarForever channel-conditioning tensors. Reports zero identity-conditioning weights. No downloads."
 
     def load(self, unet_name):
         path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
@@ -124,6 +170,10 @@ class SEAvatarForeverLoader:
         model = model.clone()
         model.model_options["avatarforever_weights"] = weights
         model.model_options["avatarforever_checkpoint"] = unet_name
+        model.model_options["avatarforever_channel_nonzero"] = bool(torch.count_nonzero(weights[0]))
+        if not model.model_options["avatarforever_channel_nonzero"]:
+            logging.warning("[AvatarForever] This checkpoint has a zero channel-condition projection. "
+                            "Channel Condition cannot reinforce identity; the first-frame image still applies.")
         return (model,)
 
 
@@ -151,7 +201,7 @@ class SEAvatarForeverSampler:
             "relative_positions": ("BOOLEAN", {"default": True}),
             "forever_cache": ("BOOLEAN", {"default": False, "tooltip": "Official approximate history-feature reuse after step 1 of each chunk. Faster, may change output. Released CLI default is off."}),
             "cache_device": (["auto", "gpu", "cpu"], {"default": "auto"}),
-            "channel_condition": ("BOOLEAN", {"default": True, "tooltip": "Learned image conditioning on every new chunk; without image derives identity from generated chunk 0."}),
+            "channel_condition": ("BOOLEAN", {"default": True, "tooltip": "Checkpoint image conditioning on each new chunk. The current public checkpoint has a zero projection, so this control has no effect with those weights."}),
             "channel_mode": (["gated", "add"], {"default": "gated"}),
             "first_frame_prefix": ("BOOLEAN", {"default": False, "tooltip": "Reuse the generated first latent frame and aligned audio if chunk 0 is no longer in history."}),
             "prefix_position": (["prepend", "append"], {"default": "prepend"}),
@@ -171,6 +221,7 @@ class SEAvatarForeverSampler:
             "mouth_blend": ("FLOAT", {"default": .7, "min": 0, "max": 1, "step": .01, "tooltip": "Feathered mouth-only blend. 0 leaves every frame unchanged."}),
             "mouth_model": ("STRING", {"default": "codeformer.pth", "tooltip": "Existing file under models/facerestore_models. No automatic download."}),
             "mouth_detector": ("STRING", {"default": "models/buffalo_l/det_10g.onnx", "tooltip": "Existing SCRFD detector under models/insightface. No automatic download."}),
+            "live_preview": (["auto", "latent", "off"], {"default": "auto", "tooltip": "Preview the newest predicted frame from the first sampling step. Auto uses an installed taeltx2_3.safetensors on CPU, otherwise a fast latent preview. No download; final video is unchanged."}),
         }, "hidden": {"unique_id": "UNIQUE_ID"}}
 
     RETURN_TYPES = ("VIDEO", "STRING")
@@ -189,7 +240,7 @@ class SEAvatarForeverSampler:
                temporal_tile=128, temporal_overlap=32, crf=17, encoding_preset="fast",
                filename_prefix="video/AvatarForever/Avatar", image=None, unique_id=None, match_image_aspect=True,
                mouth_enhancement=False, mouth_fidelity=.9, mouth_blend=.7,
-               mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx"):
+               mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", live_preview="auto"):
         started = time.perf_counter()
         if mouth_enhancement and mouth_blend != 0:
             from .codeformer_mouth import CodeFormerMouth, model_path
@@ -202,6 +253,9 @@ class SEAvatarForeverSampler:
             if value not in self.INPUT_TYPES()["required"][key][0]:
                 raise ValueError(f"Invalid AvatarForever {key}: {value}")
         schedule = parse_sigmas(sigmas)
+        if live_preview not in ("auto", "latent", "off"):
+            raise ValueError(f"Invalid AvatarForever live_preview: {live_preview}")
+        channel_effective = channel_condition and model.model_options.get("avatarforever_channel_nonzero", True)
         if width < 32 or height < 32 or fps <= 0 or chunk_size < 1 or history_chunks < -1:
             raise ValueError("AvatarForever needs positive dimensions, FPS and chunk size; history must be -1 or greater.")
         width, height = math.ceil(width / 32) * 32, math.ceil(height / 32) * 32
@@ -254,6 +308,9 @@ class SEAvatarForeverSampler:
         weights = tuple(w.to(device=device, dtype=dtype) for w in model.model_options["avatarforever_weights"])
         generator = torch.Generator("cpu").manual_seed(seed)
         progress = comfy.utils.ProgressBar(len(plan) * (len(schedule) - 1), node_id=unique_id)
+        preview = AvatarPreview(live_preview, model.model.latent_format) if live_preview != "off" else None
+        preview_seconds = 0.
+        first_preview_seconds = None
         completed = 0
         channel = anchor if channel_condition else None
         print(f"[AvatarForever] {seconds:.2f}s -> {frames} frames, {len(plan)} chunks, {width}x{height}, cache={forever_cache}/{cache_device}", flush=True)
@@ -301,6 +358,13 @@ class SEAvatarForeverSampler:
                               (times, torch.zeros((1, len(ai), 1), device=device)), context,
                               attention_mask=attention_mask, frame_rate=fps, transformer_options=opts)[0]
                 velocity = velocity[:, :, vstart:vstart + end - start].float()
+                preview_image = None
+                if preview is not None:
+                    preview_started = time.perf_counter()
+                    preview_image = preview.decode(current - sigma * velocity)
+                    preview_seconds += time.perf_counter() - preview_started
+                    if first_preview_seconds is None:
+                        first_preview_seconds = time.perf_counter() - started
                 if fixed is not None:
                     prediction = current[:, :, :1] - sigma * velocity[:, :, :1]
                     prediction = prediction * (1 - image_strength) + fixed * image_strength
@@ -310,13 +374,13 @@ class SEAvatarForeverSampler:
                     # Official post_process_latent blends the prediction AND update.
                     current[:, :, :1] = current[:, :, :1] * (1 - image_strength) + fixed * image_strength
                 completed += 1
-                progress.update_absolute(completed)
+                progress.update_absolute(completed, preview=preview_image)
             video[:, :, start:end] = current.cpu()
             if index == 0 and channel_condition and channel is None:
                 channel = video[:, :, :1].clone()
             print(f"[AvatarForever] chunk {index + 1}/{len(plan)}: {time.perf_counter() - chunk_started:.2f}s", flush=True)
             del cache, state, opts, current, window, velocity
-        dit_seconds = time.perf_counter() - dit_started
+        dit_seconds = time.perf_counter() - dit_started - preview_seconds
         del context, weights, channel
         output_dir = folder_paths.get_output_directory()
         out_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(filename_prefix, output_dir, width, height)
@@ -347,7 +411,11 @@ class SEAvatarForeverSampler:
                   "relative_positions": relative_positions, "channel_mode": channel_mode,
                   "first_frame_prefix": first_frame_prefix, "prefix_position": prefix_position,
                   "image_strength": image_strength, "resident_weights": resident_weights,
-                  "channel_condition": channel_condition, "image": anchor is not None, "dit_seconds": round(dit_seconds, 2),
+                  "channel_condition": channel_condition, "channel_condition_effective": channel_effective,
+                  "image": anchor is not None, "dit_seconds": round(dit_seconds, 2),
+                  "preview": {"method": preview.method if preview is not None else "off",
+                              "first_preview_seconds": round(first_preview_seconds, 3) if first_preview_seconds is not None else None,
+                              "processing_seconds": round(preview_seconds, 3)},
                   "mouth_enhancement": mouth.report if mouth is not None else {"enabled": False},
                   "total_seconds": round(time.perf_counter() - started, 2), "path": output}
         text = json.dumps(report, indent=2)

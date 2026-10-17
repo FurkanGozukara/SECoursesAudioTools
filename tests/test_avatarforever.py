@@ -14,6 +14,43 @@ from custom_nodes.SECoursesAudioTools.codeformer_mouth import blend_mouth, mouth
 
 
 class AvatarForeverTests(unittest.TestCase):
+    def test_preview_shows_latest_generated_frame_without_changing_latents(self):
+        preview = object.__new__(af.AvatarPreview)
+        seen = []
+
+        class Vae:
+            def decode(self, frame):
+                seen.append(frame.clone())
+                return torch.full((1, frame.shape[-2] * 32, frame.shape[-1] * 32, 3), .5)
+
+        preview.vae = Vae()
+        latent = torch.arange(4.).reshape(1, 1, 4, 1, 1).expand(1, 128, 4, 24, 16).clone()
+        original = latent.clone()
+        result = preview.decode(latent)
+        self.assertEqual(seen[0].shape, (1, 128, 1, 24, 16))
+        self.assertTrue(torch.all(seen[0] == 3))
+        self.assertEqual(result[1].size, (341, 512))
+        torch.testing.assert_close(latent, original)
+
+    def test_preview_falls_back_without_downloading_or_loading_full_vae(self):
+        fmt = SimpleNamespace(latent_rgb_factors=[[1., 0., 0.]], latent_rgb_factors_bias=[0., 0., 0.])
+        with patch.object(af.folder_paths, 'get_filename_list', return_value=[]), patch.object(af.comfy.sd, 'VAE') as load:
+            preview = af.AvatarPreview('auto', fmt)
+            self.assertEqual(preview.method, 'latent')
+            self.assertEqual(preview.decode(torch.zeros(1, 1, 2, 2, 3))[1].size, (3, 2))
+            load.assert_not_called()
+
+    def test_broken_optional_preview_model_does_not_break_generation(self):
+        fmt = SimpleNamespace(latent_rgb_factors=[[1., 0., 0.]], latent_rgb_factors_bias=[0., 0., 0.])
+        with patch.object(af.folder_paths, 'get_filename_list', return_value=['taeltx2_3.safetensors']), \
+             patch.object(af.folder_paths, 'get_full_path_or_raise', side_effect=OSError('bad preview file')):
+            preview = af.AvatarPreview('auto', fmt)
+        self.assertEqual(preview.method, 'latent')
+        self.assertEqual(preview.decode(torch.zeros(1, 1, 2, 2, 3))[1].size, (3, 2))
+        preview.vae = SimpleNamespace(decode=lambda _: (_ for _ in ()).throw(RuntimeError('preview decode failed')))
+        self.assertEqual(preview.decode(torch.zeros(1, 1, 2, 2, 3))[1].size, (3, 2))
+        self.assertIsNone(preview.vae)
+
     def test_requested_durations_cover_audio_without_gaps(self):
         for seconds in (0.01, 10, 30, 60, 300):
             audio = {"sample_rate": 1000, "waveform": torch.zeros(1, 1, round(seconds * 1000))}

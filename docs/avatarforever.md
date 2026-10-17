@@ -166,8 +166,17 @@ Turning AvatarForever Enabled off returns to the normal Swarm workflow.
 
 ## Live preview, 2026-10-17
 
-The sampler now sends the newest predicted video frame through ComfyUI's native
-preview transport after each denoising step. The first preview arrives at step 1;
+The unified Comfy preset has a separate **Live Preview & Final Video** panel to
+the right of the generation controls. It shows sampling previews first, then the
+finished MP4 with playback controls. Connect the sampler's `video` output directly
+to **AvatarForever Live Preview & Final Video** to add the panel to an existing
+workflow. It displays the saved file without re-encoding or saving another copy.
+Workflows without the panel, including SwarmUI, keep previews on the sampler.
+The panel uses its own preview event and media widget so live stills reliably
+switch to the final video in both the classic canvas and Nodes 2.0.
+
+The sampler sends the newest predicted video frame after each denoising step,
+using ComfyUI's native preview transport when no panel is connected. The first preview arrives at step 1;
 model loading, text/audio encoding and that first step must still finish first.
 This is a sequence of approximate still previews, not an audio/video stream.
 The final playable MP4 continues to appear after decoding and export.

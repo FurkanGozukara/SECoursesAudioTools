@@ -3,17 +3,54 @@ import math
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 from custom_nodes.SECoursesAudioTools import avatarforever_nodes as af
 from custom_nodes.SECoursesAudioTools.codeformer_mouth import blend_mouth, mouth_mask, CodeFormerMouth, TEMPLATE
 
 
 class AvatarForeverTests(unittest.TestCase):
+    def test_preview_panels_follow_only_their_connected_sampler(self):
+        prompt = {
+            "10": {"class_type": "SEAvatarForeverPreview", "inputs": {"video": ["8", 0]}},
+            "11": {"class_type": "SEAvatarForeverPreview", "inputs": {"video": ["88", 0]}},
+            "12": {"class_type": "SaveVideo", "inputs": {"video": ["8", 0]}},
+            "13": {"class_type": "SEAvatarForeverPreview", "inputs": {"video": ["8", 0]}},
+        }
+        self.assertEqual(af.preview_node_ids(prompt, "8"), ["10", "13"])
+        self.assertEqual(af.preview_node_ids(prompt, "88"), ["11"])
+        self.assertEqual(af.preview_node_ids(prompt, "9"), [])
+        self.assertEqual(af.preview_node_ids(None, "8"), [])  # Existing Swarm/API graphs.
+
+    def test_panel_preview_is_bounded_and_sent_only_to_the_requesting_client(self):
+        image = Image.new("RGB", (768, 512))
+        server = SimpleNamespace(client_id="panel-client", send_sync=Mock())
+        with patch.object(af.PromptServer, "instance", server, create=True):
+            af.send_panel_preview(["10", "13"], ("JPEG", image, 512))
+        event, payload, client = server.send_sync.call_args.args
+        self.assertEqual((event, client), ("se_avatarforever_preview", "panel-client"))
+        self.assertEqual(payload["node_ids"], ["10", "13"])
+        self.assertTrue(payload["image"].startswith("data:image/jpeg;base64,"))
+        jpeg = Image.open(af.io.BytesIO(af.base64.b64decode(payload["image"].split(",", 1)[1])))
+        self.assertEqual(jpeg.size, (512, 341))
+        self.assertEqual(image.size, (768, 512))
+
+    def test_preview_panel_reuses_the_saved_video_without_decoding(self):
+        root = af.Path(af.folder_paths.get_output_directory()).resolve()
+        video = SimpleNamespace(get_stream_source=lambda: str(root / "video" / "AvatarForever" / "clip.mp4"))
+        result = af.SEAvatarForeverPreview().show(video)
+        self.assertEqual(result["ui"], {"images": [{"filename": "clip.mp4", "subfolder": "video/AvatarForever",
+                                                   "type": "output"}], "animated": (True,)})
+        self.assertEqual(result["result"], ())
+        video.get_stream_source = lambda: str(root.parent / "outside.mp4")
+        with self.assertRaises(ValueError):
+            af.SEAvatarForeverPreview().show(video)
+
     def test_preview_shows_latest_generated_frame_without_changing_latents(self):
         preview = object.__new__(af.AvatarPreview)
         seen = []

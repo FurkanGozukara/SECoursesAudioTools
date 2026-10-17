@@ -1,9 +1,12 @@
 """Native AvatarForever image + audio / text + audio streaming nodes."""
 
+import base64
+import io
 import json
 import logging
 import math
 import os
+from pathlib import Path
 import time
 
 import torch
@@ -18,6 +21,7 @@ import latent_preview
 import nodes
 from comfy_api.latest import InputImpl
 from comfy_extras.nodes_audio import VAEEncodeAudio
+from server import PromptServer
 
 from .avatarforever_model import avatar_forward
 from .h3_streaming_nodes import FFmpegWriter, mux_audio, write_wav
@@ -67,6 +71,48 @@ class AvatarPreview:
         preview_image = latent_preview.preview_to_image(pixels, do_scale=False)
         preview_image.thumbnail((512, 512))
         return "JPEG", preview_image, 512
+
+
+def preview_node_ids(prompt, sampler_id):
+    return [node_id for node_id, node in (prompt or {}).items()
+            if node.get("class_type") == "SEAvatarForeverPreview"
+            and node.get("inputs", {}).get("video") == [str(sampler_id), 0]]
+
+
+def send_panel_preview(node_ids, preview):
+    # A separate event keeps native still-preview caches from masking the final MP4.
+    image = preview[1].copy()
+    image.thumbnail((512, 512))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    server = PromptServer.instance
+    server.send_sync("se_avatarforever_preview", {
+        "node_ids": node_ids,
+        "image": "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii"),
+    }, server.client_id)
+
+
+class SEAvatarForeverPreview:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("VIDEO",)}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = "SECourses/AvatarForever"
+    DESCRIPTION = "Connect directly to AvatarForever's video output. Shows live sampling previews, then the saved video with playback controls. Does not re-encode or save another copy."
+
+    def show(self, video):
+        source = video.get_stream_source()
+        if not isinstance(source, (str, os.PathLike)):
+            raise ValueError("Connect the saved video output of AvatarForever.")
+        path = Path(source).resolve()
+        root = Path(folder_paths.get_output_directory()).resolve()
+        relative = path.relative_to(root)
+        subfolder = relative.parent.as_posix() if relative.parent != Path(".") else ""
+        return {"ui": {"images": [{"filename": relative.name, "subfolder": subfolder,
+                                  "type": "output"}], "animated": (True,)}, "result": ()}
 
 
 def chunk_plan(total, audio_steps, chunk_size):
@@ -222,7 +268,7 @@ class SEAvatarForeverSampler:
             "mouth_model": ("STRING", {"default": "codeformer.pth", "tooltip": "Existing file under models/facerestore_models. No automatic download."}),
             "mouth_detector": ("STRING", {"default": "models/buffalo_l/det_10g.onnx", "tooltip": "Existing SCRFD detector under models/insightface. No automatic download."}),
             "live_preview": (["auto", "latent", "off"], {"default": "auto", "tooltip": "Preview the newest predicted frame from the first sampling step. Auto uses an installed taeltx2_3.safetensors on CPU, otherwise a fast latent preview. No download; final video is unchanged."}),
-        }, "hidden": {"unique_id": "UNIQUE_ID"}}
+        }, "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"}}
 
     RETURN_TYPES = ("VIDEO", "STRING")
     RETURN_NAMES = ("video", "report")
@@ -240,7 +286,7 @@ class SEAvatarForeverSampler:
                temporal_tile=128, temporal_overlap=32, crf=17, encoding_preset="fast",
                filename_prefix="video/AvatarForever/Avatar", image=None, unique_id=None, match_image_aspect=True,
                mouth_enhancement=False, mouth_fidelity=.9, mouth_blend=.7,
-               mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", live_preview="auto"):
+               mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", live_preview="auto", prompt=None):
         started = time.perf_counter()
         if mouth_enhancement and mouth_blend != 0:
             from .codeformer_mouth import CodeFormerMouth, model_path
@@ -307,6 +353,7 @@ class SEAvatarForeverSampler:
             attention_mask = attention_mask.to(device)
         weights = tuple(w.to(device=device, dtype=dtype) for w in model.model_options["avatarforever_weights"])
         generator = torch.Generator("cpu").manual_seed(seed)
+        preview_ids = preview_node_ids(prompt, unique_id)
         progress = comfy.utils.ProgressBar(len(plan) * (len(schedule) - 1), node_id=unique_id)
         preview = AvatarPreview(live_preview, model.model.latent_format) if live_preview != "off" else None
         preview_seconds = 0.
@@ -374,7 +421,12 @@ class SEAvatarForeverSampler:
                     # Official post_process_latent blends the prediction AND update.
                     current[:, :, :1] = current[:, :, :1] * (1 - image_strength) + fixed * image_strength
                 completed += 1
-                progress.update_absolute(completed, preview=preview_image)
+                if preview_ids:
+                    if preview_image is not None:
+                        send_panel_preview(preview_ids, preview_image)
+                    progress.update_absolute(completed)
+                else:
+                    progress.update_absolute(completed, preview=preview_image)
             video[:, :, start:end] = current.cpu()
             if index == 0 and channel_condition and channel is None:
                 channel = video[:, :, :1].clone()
@@ -421,11 +473,13 @@ class SEAvatarForeverSampler:
         text = json.dumps(report, indent=2)
         with open(base + ".json", "w", encoding="utf-8") as handle:
             handle.write(text)
-        return {"ui": {"text": [text], "images": [{"filename": os.path.basename(output),
+        return {"ui": {} if preview_ids else {"text": [text], "images": [{"filename": os.path.basename(output),
                     "subfolder": subfolder, "type": "output"}], "animated": (True,)},
                 "result": (InputImpl.VideoFromFile(output), text)}
 
 
-NODE_CLASS_MAPPINGS = {"SEAvatarForeverLoader": SEAvatarForeverLoader, "SEAvatarForeverSampler": SEAvatarForeverSampler}
+NODE_CLASS_MAPPINGS = {"SEAvatarForeverLoader": SEAvatarForeverLoader, "SEAvatarForeverSampler": SEAvatarForeverSampler,
+                       "SEAvatarForeverPreview": SEAvatarForeverPreview}
 NODE_DISPLAY_NAME_MAPPINGS = {"SEAvatarForeverLoader": "AvatarForever Model Loader (Native INT8 / BF16 / FP8)",
-                            "SEAvatarForeverSampler": "AvatarForever - Audio + Optional Image to Long Video"}
+                            "SEAvatarForeverSampler": "AvatarForever - Audio + Optional Image to Long Video",
+                            "SEAvatarForeverPreview": "AvatarForever Live Preview & Final Video"}

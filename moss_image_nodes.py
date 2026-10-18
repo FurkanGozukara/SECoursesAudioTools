@@ -7,6 +7,7 @@ weights disabled, so `(word:1.2)` would reach the model as literal text.
 
 import json
 import math
+import os
 import random
 import re
 
@@ -231,6 +232,14 @@ def model_variant(model):
         return None
 
 
+def model_file_name(model):
+    """File name ComfyUI loaded the MODEL from (cached_patcher_init holds the loader call), or None."""
+    try:
+        return os.path.basename(str(model.cached_patcher_init[1][0]))
+    except (AttributeError, TypeError, IndexError):
+        return None
+
+
 def lora_choices(default):
     import folder_paths
 
@@ -267,6 +276,11 @@ class SEMossImageSFTDeBand:
         if not enabled:
             return (model,)
         variant = model_variant(model)
+        name = model_file_name(model)
+        if variant == "Base" and name and "sft" in name.lower():
+            # ComfyUI's official MOSS-Image bounding-box template (templates 0.11.89) downloads Base under the SFT name.
+            print(f"[SECourses MOSS-Image] WARNING: {name} holds the Base weights, not SFT. Delete it and download the SFT "
+                  "file again (MOSS-Image Core Bundle).", flush=True)
         if variant != "SFT":
             reason = "the Base model has no SFT banding" if variant == "Base" else "the model is not the original MOSS-Image SFT"
             print(f"[SECourses MOSS-Image] SFT de-band skipped: {reason}.", flush=True)

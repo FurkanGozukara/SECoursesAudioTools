@@ -115,5 +115,32 @@ class MossImageEncodeTests(unittest.TestCase):
             self.assertEqual(moss.schedule_prompt(text)[0], expected, text)
 
 
+class MossImageDeBandTests(unittest.TestCase):
+    def model(self, path):
+        return SimpleNamespace(cached_patcher_init=(object, (path, {})))
+
+    def run_base(self, path):
+        model = self.model(path)
+        with patch.object(moss, "model_variant", return_value="Base"), patch("builtins.print") as printed:
+            out = moss.SEMossImageSFTDeBand().apply(model, True, "None", 1.0)
+        self.assertIs(out[0], model)
+        return " ".join(str(call.args[0]) for call in printed.call_args_list)
+
+    def test_file_name_comes_from_the_loader_call(self):
+        self.assertEqual(moss.model_file_name(self.model("G:/models/diffusion_models/moss_image_sft_int8_convrot.safetensors")),
+                         "moss_image_sft_int8_convrot.safetensors")
+        self.assertIsNone(moss.model_file_name(SimpleNamespace()))
+
+    def test_base_weights_under_an_sft_name_are_reported(self):
+        messages = self.run_base("diffusion_models/moss_image_sft_int8_convrot.safetensors")
+        self.assertIn("holds the Base weights, not SFT", messages)
+        self.assertIn("SFT de-band skipped", messages)
+
+    def test_real_base_file_has_no_warning(self):
+        messages = self.run_base("diffusion_models/moss_image_base_int8_convrot.safetensors")
+        self.assertNotIn("WARNING", messages)
+        self.assertIn("SFT de-band skipped", messages)
+
+
 if __name__ == "__main__":
     unittest.main()

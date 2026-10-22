@@ -20,11 +20,20 @@ CHOICE = re.compile(r"(?<!\\)\{([^{}]*\|[^{}]*)\}")
 BRACKET = re.compile(r"(?<!\\)\[([^\[\]]*)\]")
 FROM_TO = re.compile(r"^[^:|]*:[^:|]*:\s*(?:\d+(?:\.\d*)?|\.\d+)\s*$")
 TO_AT = re.compile(r"^[^:|]*:\s*(?:\d+(?:\.\d*)?|\.\d+)\s*$")
+# Image labels of the other SECourses presets; Moss-Image-Edit was trained with "image 1", "image 2", ...
+IMAGE_LABEL = re.compile(r"@(?:image|img|picture|pic)(\d+)\b|<image_(\d+)>", re.I)
 
 
-def media_check(references):
-    if references.get("images") or references.get("videos") or references.get("audios"):
-        raise ValueError("MOSS-Image is a text-to-image model and does not use reference media. Remove the gallery cards, or use another model's preset for image editing.")
+def media_check(references, edit_images=False):
+    if not edit_images and (references.get("images") or references.get("videos") or references.get("audios")):
+        raise ValueError("MOSS-Image is a text-to-image model and does not use reference media. Remove the gallery cards, or use a MOSS Image Edit preset to edit images.")
+    if references.get("videos") or references.get("audios"):
+        raise ValueError("MOSS-Image Edit takes image references only. Remove the video/audio cards from the gallery.")
+
+
+def edit_labels(text):
+    """@image1 and <image_1> become "image 1", the wording of Moss-Image-Edit's training prompts."""
+    return IMAGE_LABEL.sub(lambda match: f"image {match.group(1) or match.group(2)}", text)
 
 
 def parse_json_prompt(text):
@@ -160,6 +169,8 @@ class SEMossImageGalleryPrompt:
             "optional": {
                 "width": ("INT", {"forceInput": True, "tooltip": "Output width: scales pixel layout drafts and checks layout boxes."}),
                 "height": ("INT", {"forceInput": True, "tooltip": "Output height: scales pixel layout drafts and checks layout boxes."}),
+                "edit_images": ("BOOLEAN", {"default": False, "label_on": "gallery images: edit (Moss-Image-Edit)", "label_off": "gallery images: rejected",
+                                            "tooltip": "On for the MOSS Image Edit presets: gallery images are the images to edit (MOSS-Image Edit References node), and @image1 / <image_1> in the prompt become image 1."}),
             },
         }
 
@@ -169,11 +180,12 @@ class SEMossImageGalleryPrompt:
     CATEGORY = "SECourses/MOSS-Image"
     DESCRIPTION = ("Gallery prompt for MOSS-Image: resolves {a|b} choices with the seed, removes (word:1.2) weight syntax that "
                    "Qwen3.5 would read literally, and passes JSON prompts through unchanged (compact). Official pixel layout drafts "
-                   "(width, height, abs, xyxy) are compiled to the model's centred yxyx boxes. Gallery media is rejected.")
+                   "(width, height, abs, xyxy) are compiled to the model's centred yxyx boxes. Gallery media is rejected unless edit_images is on.")
 
-    def prepare(self, references, seed=0, width=None, height=None):
-        media_check(references)
-        return prepare_prompt(references.get("prompt", ""), seed, width, height)
+    def prepare(self, references, seed=0, width=None, height=None, edit_images=False):
+        media_check(references, edit_images)
+        prompt = references.get("prompt", "")
+        return prepare_prompt(edit_labels(prompt) if edit_images else prompt, seed, width, height)
 
 
 class SEMossImageTextEncode:

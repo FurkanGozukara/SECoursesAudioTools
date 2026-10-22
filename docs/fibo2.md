@@ -7,7 +7,7 @@ Bria Fibo 2.0 is an 8B flow-matching DiT that generates and edits images: text t
 - `SEFibo2EditCanvas` (**Fibo 2.0 Optional Edit Image + Mask**): an optional image for a masked edit, painted with ComfyUI's native Mask Editor ("Paint mask (native editor)" button). Like Bria's training, the masked area (mask above 50%) is filled with flat grey (128) at the image's own size before encoding. A painted mask edits this image alone, so gallery images are refused with a clear message. `(none - disabled)` turns the canvas off.
 - `SEFibo2RestoreUnmasked` (**Fibo 2.0 Keep Unmasked Pixels**): after a masked edit, copies every pixel outside the mask back from the source (soft edges blend). Other generations pass through.
 - `SEFibo2SwarmInputs` (**Fibo 2.0 SwarmUI Inputs**): turns the SwarmUI prompt images, Init Image and mask (base64) into the gallery pack, so the [Fibo2 SwarmUI extension](https://github.com/FurkanGozukara/SwarmUI_Premium_Extensions/tree/main/Fibo2) uses the same encoder.
-- `web/fibo2.js`: the presets' gallery has the property `fibo2_images_only` (images only, prompt sent as typed, "1 image to edit (up to 4 recommended)" counter, video controls hidden); the edit canvas gets the Mask Editor and "Clear image + mask" buttons.
+- `web/edit_gallery.js`: the presets' gallery has the property `fibo2_images_only` (images only, prompt sent as typed, "1 image to edit (up to 4 recommended)" counter, video controls hidden; the MOSS Image Edit presets share this profile). `web/fibo2.js`: the edit canvas gets the Mask Editor and "Clear image + mask" buttons.
 
 ## Presets
 

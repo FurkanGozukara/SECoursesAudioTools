@@ -44,7 +44,20 @@ ComfyUI `ce1e922d`, frontend 1.55.17, Torch 2.13.0+cu130. Physical GPU 1 (RTX 30
 - The four SFT presets recorded SECoursesAudioTools `1250cd8`, a commit without the MOSS nodes; all six now record the commit that has them.
 - 13 regression tests, including the Base-weights-under-an-SFT-name warning.
 
-Limitations: tested on an RTX 3090 only, so the attention findings may differ on RTX 50 series cards. MOSS-Image does not edit images or use references.
+## Image edit, 2026-10-22
+
+[ChenkinLab's Moss-Image-Edit](https://modelscope.cn/models/ChenkinLab/Moss-Image-Edit) (rank-64 LoRA trained on MOSS-Image SFT) edits images with a text instruction and up to four images. The LoRA alone does not edit: the model also needs a reference branch, which ChenkinLab ships as a separate diffusers runtime.
+
+- `SEMossImageEditReferences` (**MOSS-Image Edit References**) adds that branch to ComfyUI's native MOSS-Image model through the model patcher: the gallery images (scaled down to `reference_max_edge` on the long side, multiples of 16, like the official node) pass through every block at timestep 0 and attend only to each other; the text and the result keep MOSS-Image's own attention and also attend to the references' keys and values of the same block. The keys and values are computed once per sampling run (outer-sample scope) and reused for every step and both CFG branches. Its `width` / `height` outputs are image 1's reference size: the adapter lines the result up with image 1 token by token, and a different size lost the identity and layout in our tests. Without gallery images the model passes through.
+- `SEMossImageGalleryPrompt` has a new `edit_images` switch (off by default, so existing presets are unchanged): gallery images are allowed and `@image1` / `<image_1>` become "image 1", the wording of the training prompts.
+- `web/edit_gallery.js`: the edit presets' gallery takes images only (property `moss_edit_images`), like the Fibo 2.0 presets.
+- The LoRA is re-hosted with ComfyUI LoRA keys (tensors unchanged) as `MonsterMMORPG/Wan_GGUF/MOSS_Image_Edit_LoRA.safetensors` (MOSS-Image Core Bundle), so the native `LoraLoaderModelOnly` loads it, also on the fused-qkv INT8 ConvRot files.
+
+Presets `Presets/MOSS Image Edit - Advanced Image Edit - 261022.json` (official recipe: SFT INT8, edit LoRA 1.0, de-band, PyTorch attention, shift 5, 30 steps Euler / normal, CFG 4, empty negative, references 1024) and `MOSS Image Edit - Turbo 8 Steps - 261022.json` (plus the 8-step DMD LoRA at 0.7, Euler / simple, CFG 1). RTX 5090, 1 MP: 9-12 s and about 3 s.
+
+Tests (RTX 5090, ComfyUI `1a82e6d0`): `tests/test_moss_image_edit.py` checks the patched native model against a straight-line version of ChenkinLab's algorithm (separate and fused qkv, two references of different sizes, cache reuse across steps) and the official reference size rule; a reference position shifted by one token makes it fail. Same seed and settings: 30 and 50 steps looked the same; reference edges 512, 768, 1024 and 1536 all kept the image when the result had image 1's size; SFT de-band and layer-skip 22 changed nothing important; Base lost the subject in one of two tests, so the presets use SFT; the DMD Turbo combination kept identity, lettering and composition. The cafe test kept "MORNING BREW" and the chalkboard lettering through a winter edit. A second image's object was placed well but its exact look was only loosely copied.
+
+Limitations: the text-to-image findings were tested on an RTX 3090 only, so the attention findings may differ on RTX 50 series cards. Without the edit LoRA and its reference branch MOSS-Image does not edit images. ChenkinLab's code is GPLv3; no separate license is stated for the weights.
 
 The SwarmUI presets use the [MossImage premium extension](https://github.com/FurkanGozukara/SwarmUI_Premium_Extensions/tree/main/MossImage), which builds the same recipe with native nodes; its README documents the Swarm validation.
 

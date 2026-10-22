@@ -103,7 +103,7 @@ def gallery_images(references):
     """Gallery images in card order as [1, H, W, 3] tensors; transparency is composited on white.
     SwarmUI attachments arrive already decoded in image_tensors."""
     if references.get("videos") or references.get("audios"):
-        raise ValueError("Fibo 2.0 takes image references only. Remove the video/audio cards from the gallery.")
+        raise ValueError("This model takes image references only. Remove the video/audio cards from the gallery.")
     images = []
     entries = references.get("images", [])
     if entries:

@@ -42,3 +42,7 @@ class MouthPassWriterTests(TestCase):
         with patch("custom_nodes.SECoursesAudioTools.codeformer_mouth.model_path", side_effect=FileNotFoundError("codeformer.pth")):
             with self.assertRaises(FileNotFoundError):
                 ll.SEH3LongLipSync().generate(None, None, None, None, None, None, 0, 4, mouth_pass=True)
+
+    def test_missing_soundtrack_is_a_clear_error(self):
+        with self.assertRaisesRegex(ValueError, "needs the soundtrack"):
+            ll.SEH3LongLipSync().generate(None, None, None, None, None, None, 0, 4)

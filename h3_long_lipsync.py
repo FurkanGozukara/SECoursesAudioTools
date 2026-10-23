@@ -131,6 +131,8 @@ class SEH3LongLipSync:
             from .codeformer_mouth import model_path
             model_path("facerestore_models", mouth_model)
             model_path("insightface", mouth_detector)
+        if audio is None:
+            raise ValueError("H3 Long Lip Sync needs the soundtrack: choose an audio file in the soundtrack node")
         if type(model.get_model_object("diffusion_model")).__name__ != "MiniMaxH3Model":
             raise ValueError("H3 Long Lip Sync requires a native MiniMax H3 model")
         from comfy.ldm.minimax import model as h3

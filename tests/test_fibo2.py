@@ -42,26 +42,37 @@ class Fibo2PromptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "edit canvas"):
             fibo2.prepare_prompt("keep @init", image_count=1)
 
-    def test_negative_is_encoded_as_written(self):
-        import comfy.text_encoders.fibo2 as te
-
-        expected = te.TEMPLATE.format(NEGATIVE_T2I)
-        self.assertEqual(fibo2.raw_negative(NEGATIVE_T2I), expected)
+    def test_json_negative_is_made_compact(self):
+        self.assertEqual(fibo2.compact_negative(NEGATIVE_T2I), NEGATIVE_T2I)
         # A pretty-printed copy of the same JSON becomes the same compact negative, empty fields and key order kept.
-        self.assertEqual(fibo2.raw_negative(json.dumps(json.loads(NEGATIVE_T2I), indent=4)), expected)
-        self.assertEqual(fibo2.raw_negative(""), "")
-        self.assertEqual(fibo2.raw_negative("blurry, low quality"), "blurry, low quality")
+        self.assertEqual(fibo2.compact_negative(json.dumps(json.loads(NEGATIVE_T2I), indent=4)), NEGATIVE_T2I)
+        self.assertEqual(fibo2.compact_negative(""), "")
+        self.assertEqual(fibo2.compact_negative("blurry, low quality"), "blurry, low quality")
 
-    def test_tokens_of_the_negative_match_bria_and_not_the_cleaned_caption(self):
+    def test_native_encode_gives_the_negative_bria_tokens(self):
         import comfy.text_encoders.fibo2 as te
 
         tokenizer = te.Fibo2Tokenizer()
+        texts = []
+
+        class FakeClip:
+            def tokenize(self, text, **kwargs):
+                texts.append(text)
+                return {"qwen3vl_4b": [[(0, 1.0)]]}
+
+            def encode_from_tokens_scheduled(self, tokens):
+                return [[torch.zeros(1, 1, 1), {}]]
 
         def ids(text):
             return [t[0] for batch in tokenizer.tokenize_with_weights(text)["qwen3vl_4b"] for t in batch]
 
         bria = tokenizer.qwen3vl_4b.tokenizer(te.TEMPLATE.format(NEGATIVE_T2I))["input_ids"]
-        self.assertEqual(ids(fibo2.raw_negative(NEGATIVE_T2I)), bria)
+        for negative in (NEGATIVE_T2I, json.dumps(json.loads(NEGATIVE_T2I), indent=4)):
+            texts.clear()
+            fibo2.encode(FakeClip(), None, "a fox", negative, [], fibo2.SIZE_MODES[0], 1024, 1024, 1)
+            # one chat turn: TextEncodeFibo2 wraps the negative itself, a second wrap would double the template
+            self.assertEqual(texts[-1].count("<|im_start|>user"), 1)
+            self.assertEqual(ids(texts[-1]), bria)
         self.assertNotEqual(ids(NEGATIVE_T2I), bria)
 
 
@@ -192,7 +203,7 @@ class Fibo2EncodeTests(unittest.TestCase):
         (_, _, latent, restore), seen = self.run_encode(prompt="replace the mug", edit_image=canvas, edit_mask=mask,
                                                          negative_prompt=NEGATIVE_T2I)
         self.assertTrue(torch.all(seen["images"]["image_1"][0, 16:48, 16:48] == 128 / 255))
-        self.assertTrue(seen["negative"].startswith("<|im_start|>user\n{\"short_description\":\"\""))
+        self.assertEqual(seen["negative"], NEGATIVE_T2I)
         self.assertEqual(tuple(restore["canvas"].shape), (1, 1024, 1024, 3))
         self.assertEqual(tuple(restore["mask"].shape), (1024, 1024))
         with self.assertRaisesRegex(ValueError, "single image"):

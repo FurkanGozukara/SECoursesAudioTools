@@ -1,13 +1,11 @@
 """Connect the SECourses prompt gallery and SwarmUI to native Fibo 2.0 conditioning.
 
 Fibo 2.0 (Bria) reads a structured JSON caption (Bria's VGL) or plain text with Qwen3-VL 4B. ComfyUI's native
-TextEncodeFibo2 cleans the caption, wraps edits, draws the caption's text images and adds the reference latents.
-These nodes feed it gallery images and a masked-edit canvas, and follow Bria's pipeline (diffusers
-BriaFibo2Pipeline) in the two places where ComfyUI's defaults differ from it:
-- Bria encodes the negative prompt as written. TextEncodeFibo2 cleans a JSON negative and drops its empty fields
-  (163 instead of 181 tokens for the model card's text-to-image negative).
-- Bria shifts the sigmas by the image size (FLUX's dynamic shift, 0.5 at 256 tokens to 1.15 at 4096 tokens of
-  16x16 pixels). ComfyUI uses 1.15 at every size, Bria's value only at about 1024x1024.
+TextEncodeFibo2 cleans the caption, wraps edits, draws the caption's text images, adds the reference latents and
+encodes the negative prompt as written in the chat template, as Bria does (ComfyUI #17285). These nodes feed it
+gallery images and a masked-edit canvas, and follow Bria's pipeline (diffusers BriaFibo2Pipeline) where ComfyUI's
+default differs from it: Bria shifts the sigmas by the image size (FLUX's dynamic shift, 0.5 at 256 tokens to 1.15
+at 4096 tokens of 16x16 pixels). ComfyUI uses 1.15 at every size, Bria's value only at about 1024x1024.
 """
 
 import base64
@@ -87,16 +85,14 @@ def prepare_prompt(text, seed=0, image_count=0, has_init=False):
     return image_labels(text, image_count, has_init)
 
 
-def raw_negative(text):
-    """Bria encodes the negative prompt as written. TextEncodeFibo2 would clean a JSON negative, so it gets the chat turn
-    itself, which the tokenizer takes as it is; the JSON is only made compact (key order and empty fields kept).
-    An empty negative stays empty: TextEncodeFibo2 then uses the null caption, Bria's default negative."""
+def compact_negative(text):
+    """A JSON negative is made compact, key order and empty fields kept, so a pretty-printed copy of the model card's
+    negative encodes like the original. TextEncodeFibo2 puts it in the chat template itself; wrapping it here too
+    would double the template. An empty negative stays empty: the null caption, Bria's default negative."""
     value = parse_json_prompt(text)
     if value is None:
         return text if isinstance(text, str) else ""
-    import comfy.text_encoders.fibo2
-
-    return comfy.text_encoders.fibo2.TEMPLATE.format(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
 def gallery_images(references):
@@ -192,7 +188,7 @@ def encode(clip, vae, prompt, negative_prompt, images, size_mode, width, height,
     elif images and size_mode == SIZE_MODES[1]:
         width = height = 0
     positive, negative, latent = TextEncodeFibo2.execute(
-        clip, prompt, raw_negative(negative_prompt), vae=vae,
+        clip, prompt, compact_negative(negative_prompt), vae=vae,
         images={f"image_{i + 1}": image for i, image in enumerate(images)},
         width=int(width), height=int(height), batch_size=int(batch_size)).result
     restore = None

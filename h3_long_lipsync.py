@@ -106,6 +106,7 @@ class SEH3LongLipSync:
             "filename_prefix": ("STRING", {"default": "video/H3_Long_Lip_Sync/Avatar"}),
             "video_crf": ("INT", {"default": 17, "min": 0, "max": 40}),
         }, "optional": {
+            "decode_vae": ("VAE", {"tooltip": "Optional decoder-only H3 LightVAE. Reference encoding keeps the original video VAE."}),
             "mouth_pass": ("BOOLEAN", {"default": False, "tooltip": "Aligned CodeFormer mouth-only restoration of every decoded chunk before encoding. Off keeps the original frames."}),
             "mouth_fidelity": ("FLOAT", {"default": .9, "min": 0, "max": 1, "step": .01, "tooltip": "CodeFormer fidelity; 0.9 is the tested recipe."}),
             "mouth_blend": ("FLOAT", {"default": .7, "min": 0, "max": 1, "step": .01, "tooltip": "Feathered mouth-only blend. 0 leaves every frame unchanged."}),
@@ -124,7 +125,7 @@ class SEH3LongLipSync:
     def generate(self, model, positive, latent, audio, audio_vae, video_vae, seed, steps,
                  window_frames="243", overlap_frames="39", filename_prefix="video/H3_Long_Lip_Sync/Avatar", video_crf=17,
                  mouth_pass=False, mouth_fidelity=.9, mouth_blend=.7,
-                 mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx"):
+                 mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", decode_vae=None):
         mouth_pass = bool(mouth_pass) and mouth_blend != 0
         if mouth_pass:
             # Fail before sampling, not after a long generation, when a mouth model is missing.
@@ -210,7 +211,8 @@ class SEH3LongLipSync:
         if mouth_pass:
             from .codeformer_mouth import CodeFormerMouth
             mouth = CodeFormerMouth(mouth_model, mouth_detector, mouth_fidelity, mouth_blend)
-        decoder = IncrementalH3Decoder(video_vae, total_steps, writer if mouth is None else MouthPassWriter(writer, mouth))
+        decoder = IncrementalH3Decoder(decode_vae if decode_vae is not None else video_vae, total_steps,
+                                       writer if mouth is None else MouthPassWriter(writer, mouth))
         try:
             decoder.decode(video, total_steps, final=True)
             writer.close()

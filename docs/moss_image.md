@@ -44,11 +44,29 @@ ComfyUI `ce1e922d`, frontend 1.55.17, Torch 2.13.0+cu130. Physical GPU 1 (RTX 30
 - The four SFT presets recorded SECoursesAudioTools `1250cd8`, a commit without the MOSS nodes; all six now record the commit that has them.
 - 13 regression tests, including the Base-weights-under-an-SFT-name warning.
 
-## Image edit, 2026-10-22
+## Color and depth control, 2026-10-28
+
+`SEMossImageControlMap` loads an optional native image; **Clear map (disabled)**
+removes it. `SEMossImageColorDepthControl` loads the community darask0 adapter
+from the MOSS-Image Core Bundle and delegates conditioning to native
+`MOSSImageControl`. With no maps or strength zero, neither the adapter nor the
+conditioning changes. Color-region IDs use nearest-neighbor resizing; depth
+uses bilinear. Existing scheduled conditioning ranges are intersected correctly.
+
+The two Color + Depth Control presets preserve the gallery, prompt/folder
+batches, shared seed/resolution and optional LoRA stack. Color is a flat ID per
+region, not a target object color; depth is near white / far black. Use one or
+both maps. For synthetic maps start with End **0.3**, strength **1** for 50 steps
+or **0.5** for Turbo eight steps. Describe subjects, clothes, positions and poses.
+Long control windows can retain mannequin surfaces; real-image maps can use End
+1. This is approximate layout guidance. Native two-person outputs and numeric
+schedule/color-ID tests were checked on the RTX 5090.
+
+## Image edit, 2026-10-22 (native conditioning update 2026-10-28)
 
 [ChenkinLab's Moss-Image-Edit](https://modelscope.cn/models/ChenkinLab/Moss-Image-Edit) (rank-64 LoRA trained on MOSS-Image SFT) edits images with a text instruction and up to four images. The LoRA alone does not edit: the model also needs a reference branch, which ChenkinLab ships as a separate diffusers runtime.
 
-- `SEMossImageEditReferences` (**MOSS-Image Edit References**) adds that branch to ComfyUI's native MOSS-Image model through the model patcher: the gallery images (scaled down to `reference_max_edge` on the long side, multiples of 16, like the official node) pass through every block at timestep 0 and attend only to each other; the text and the result keep MOSS-Image's own attention and also attend to the references' keys and values of the same block. The keys and values are computed once per sampling run (outer-sample scope) and reused for every step and both CFG branches. Its `width` / `height` outputs are image 1's reference size: the adapter lines the result up with image 1 token by token, and a different size lost the identity and layout in our tests. Without gallery images the model passes through.
+- Current presets use `SEMossImageNativeEdit` and `SEMossImageApplyEdit`: gallery images are scaled down to `reference_max_edge` on the long side, in multiples of 16, encoded with the FLUX.2 VAE and attached as native `reference_latents` with `index_timestep_zero_text_start`. The native branch preserves the original reference layout and gallery prompt schedules without replacing model blocks. Image 1 sets the output size. Without gallery images the conditioning passes through. `SEMossImageEditReferences` remains available for older saved workflows.
 - `SEMossImageGalleryPrompt` has a new `edit_images` switch (off by default, so existing presets are unchanged): gallery images are allowed and `@image1` / `<image_1>` become "image 1", the wording of the training prompts.
 - `web/edit_gallery.js`: the edit presets' gallery takes images only (property `moss_edit_images`), like the Fibo 2.0 presets.
 - The LoRA is re-hosted with ComfyUI LoRA keys (tensors unchanged) as `MonsterMMORPG/Wan_GGUF/MOSS_Image_Edit_LoRA.safetensors` (MOSS-Image Core Bundle), so the native `LoraLoaderModelOnly` loads it, also on the fused-qkv INT8 ConvRot files.

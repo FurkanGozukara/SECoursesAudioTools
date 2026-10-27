@@ -5,7 +5,7 @@ const NO_IMAGE = "(none - disabled)";
 app.registerExtension({
     name: "SECourses.Fibo2",
     nodeCreated(node) {
-        if (node.comfyClass !== "SEFibo2EditCanvas") return;
+        if (!["SEFibo2EditCanvas", "SEMossImageControlMap"].includes(node.comfyClass)) return;
         const image = node.widgets.find(w => w.name === "image");
         const upload = node.widgets.find(w => w.name === "upload");
         if (upload) upload.serialize = false;
@@ -22,6 +22,7 @@ app.registerExtension({
             if (value === NO_IMAGE) return clearPreview();
             return original?.apply(this, arguments);
         };
+        if (node.comfyClass === "SEFibo2EditCanvas") {
         const paint = node.addWidget("button", "Paint mask (native editor)", null, () => {
             if (image.value === NO_IMAGE) {
                 app.extensionManager.toast.add({severity: "info", summary: "Upload the image to edit first", life: 3000});
@@ -33,7 +34,8 @@ app.registerExtension({
         });
         paint.serialize = false;
         paint.options.serialize = false;
-        const clear = node.addWidget("button", "Clear image + mask", null, () => {
+        }
+        const clear = node.addWidget("button", node.comfyClass === "SEMossImageControlMap" ? "Clear map (disabled)" : "Clear image + mask", null, () => {
             image.value = NO_IMAGE;
             clearPreview();
         });

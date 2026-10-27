@@ -146,6 +146,21 @@ class MossImageEditTests(unittest.TestCase):
         sentinel = object()
         self.assertEqual(node.apply(sentinel, None, {"prompt": "x", "images": []}, 1024, 832, 1216), (sentinel, 832, 1216))
 
+    def test_native_chenkin_reference_branch_matches_the_official_algorithm(self):
+        for fused in (False, True):
+            model = tiny_model(fused)
+            torch.manual_seed(1)
+            context = torch.randn(2, 5, 24, device=DEVICE)
+            refs = [torch.randn(1, 8, 3, 3, device=DEVICE), torch.randn(1, 8, 2, 4, device=DEVICE)]
+            for t in (0.9, 0.35):
+                x = torch.randn(2, 8, 4, 6, device=DEVICE)
+                timestep = torch.full((2,), t, device=DEVICE)
+                with torch.no_grad():
+                    expected = oracle(model, x, timestep, context, refs)
+                    actual = model(x, timestep, context, ref_latents=refs,
+                                   ref_latents_method="index_timestep_zero_text_start")
+                torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+
 
 if __name__ == "__main__":
     unittest.main()

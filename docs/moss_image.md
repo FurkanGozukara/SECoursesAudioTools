@@ -56,8 +56,8 @@ uses bilinear. Existing scheduled conditioning ranges are intersected correctly.
 The two Color + Depth Control presets preserve the gallery, prompt/folder
 batches, shared seed/resolution and optional LoRA stack. Color is a flat ID per
 region, not a target object color; depth is near white / far black. Use one or
-both maps. For synthetic maps start with End **0.3**, strength **1** for 50 steps
-or **0.5** for Turbo eight steps. Describe subjects, clothes, positions and poses.
+both maps. For synthetic maps start with End **0.3** and strength **0.5** for
+both 50 steps and Turbo eight steps. Describe subjects, clothes, positions and poses.
 Long control windows can retain mannequin surfaces; real-image maps can use End
 1. This is approximate layout guidance. Native two-person outputs and numeric
 schedule/color-ID tests were checked on the RTX 5090.

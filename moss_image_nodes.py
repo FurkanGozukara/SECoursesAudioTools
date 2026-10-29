@@ -270,7 +270,7 @@ class SEMossImageSFTDeBand:
                 "enabled": ("BOOLEAN", {"default": True, "label_on": "SFT DE-BAND: ON", "label_off": "SFT DE-BAND: OFF",
                                         "tooltip": "Removes the faint vertical color stripes MOSS-Image SFT draws on skies, fog, walls and backdrops. Applied only to the SFT model; Base and unknown models pass through unchanged."}),
                 "fix_lora": (choices, {"default": default,
-                                       "tooltip": "Main fix: reverts SFT layers 37-41 to the Base weights (MATLOWAI/MOSS-Image-SFT-DeBand, Apache-2.0)."}),
+                                       "tooltip": "Main fix: reverts SFT layers 37-41 to the Base weights (MATLOWAI/MOSS-Image-SFT-DeBand)."}),
                 "fix_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "extra_fix_lora": (choices, {"default": "None",
                                              "tooltip": "Optional extra fix for stubborn skies and wide images (layers 32-36). Cleaner, but changes the SFT look more."}),

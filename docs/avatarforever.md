@@ -430,6 +430,3 @@ claim to reproduce the upstream compiler/fast-inference infrastructure.
 
 Conversion-build SHA-256 (before Swarm adds ModelSpec header metadata):
 `598c9bad832640ac3d9d748770f025993884c9d505238b5e898d977e5600dadb`.
-Source-derived portions are subject to the supplied
-[LTX-2 Community License](AvatarForever-LICENSE.txt). Preserve that attribution
-and check the upstream model terms when redistributing models or deploying them.

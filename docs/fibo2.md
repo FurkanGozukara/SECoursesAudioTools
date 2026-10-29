@@ -25,7 +25,7 @@ Notes from the tests:
 - Edit size: with the native auto size every edit runs at ~1 MP; a 2 MP photo lost detail and was over-edited. At its own size 2 MP edits were correct and sharp with both models, and 3 to 4 MP stayed coherent (Turbo about 11 s at 4 MP).
 - Attention: the INT8 ConvRot files request Comfy Kitchen INT8 attention in 40 layers; on the RTX 5090 every attention backend gave equivalent images, so the presets keep the files' setting. BF16 with `--use-sage-attention` also rendered correctly.
 - Dev with Comfy-Org's turbo LoRA (`fibo_2.0_turbo_lora_avg_rank_270_bf16`, strength 1, 4 steps, CFG 1) through the LoRA stack was comparable to Edit Turbo; it is an optional download.
-- Prompts: JSON captions in Bria's VGL format give the most control; `Automatic_Prompt_Generate_Enhance_To_Video_And_Image_Models_LLM_Instructions/Fibo_2.0_Enchance_Prompt_Feed_For_LLMs.txt` makes an LLM write them. Fibo 2.0 is licensed CC BY-NC 4.0.
+- Prompts: JSON captions in Bria's VGL format give the most control; `Automatic_Prompt_Generate_Enhance_To_Video_And_Image_Models_LLM_Instructions/Fibo_2.0_Enchance_Prompt_Feed_For_LLMs.txt` makes an LLM write them.
 
 ## Validation, 2026-10-22
 

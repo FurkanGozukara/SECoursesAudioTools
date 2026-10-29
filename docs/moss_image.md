@@ -75,7 +75,7 @@ Presets `Presets/MOSS Image Edit - Advanced Image Edit - 261022.json` (official 
 
 Tests (RTX 5090, ComfyUI `1a82e6d0`): `tests/test_moss_image_edit.py` checks the patched native model against a straight-line version of ChenkinLab's algorithm (separate and fused qkv, two references of different sizes, cache reuse across steps) and the official reference size rule; a reference position shifted by one token makes it fail. Same seed and settings: 30 and 50 steps looked the same; reference edges 512, 768, 1024 and 1536 all kept the image when the result had image 1's size; SFT de-band and layer-skip 22 changed nothing important; Base lost the subject in one of two tests, so the presets use SFT; the DMD Turbo combination kept identity, lettering and composition. The cafe test kept "MORNING BREW" and the chalkboard lettering through a winter edit. A second image's object was placed well but its exact look was only loosely copied.
 
-Limitations: the text-to-image findings were tested on an RTX 3090 only, so the attention findings may differ on RTX 50 series cards. Without the edit LoRA and its reference branch MOSS-Image does not edit images. ChenkinLab's code is GPLv3; no separate license is stated for the weights.
+Limitations: the text-to-image findings were tested on an RTX 3090 only, so the attention findings may differ on RTX 50 series cards. Without the edit LoRA and its reference branch MOSS-Image does not edit images.
 
 The SwarmUI presets use the [MossImage premium extension](https://github.com/FurkanGozukara/SwarmUI_Premium_Extensions/tree/main/MossImage), which builds the same recipe with native nodes; its README documents the Swarm validation.
 

@@ -16,6 +16,7 @@ import torch
 
 import comfy.model_management as mm
 import comfy.nested_tensor
+import comfy.patcher_extension
 import comfy.samplers
 import comfy.utils
 import folder_paths
@@ -76,6 +77,41 @@ def window_conditioning(positive, encoded_audio, continuation):
     return result
 
 
+def window_latents(video, span, context_noise=0.0, keystone=False):
+    """Latents and video denoise mask of one window. The anti-drift switches change only held rows."""
+    s, e, held = span["start_latent"], span["end_latent"], span["held_latents"]
+    v = video[:, :, s:e].clone()
+    vm = torch.ones((1, 1, e - s, 1, 1), dtype=v.dtype)
+    vm[:, :, :held] = 0
+    if held and keystone:
+        v[:, :, 0] = video[:, :, 0]
+    if held and context_noise:
+        # Partly noisy at the window's far start, exact at the join with the new frames; latent 0 stays exact.
+        vm[0, 0, 1:held, 0, 0] = context_noise * torch.linspace(1.0, 0.0, held - 1)
+    return v, vm
+
+
+def capstone_wrapper(anchor, sigmas, from_step):
+    """APPLY_MODEL wrapper: from sampling step `from_step` (counted from 1) on, `anchor` rides locked after
+    the window's last video latent and is cut off the prediction again. H3 video latents are unscaled, so
+    the stored latent is already in sampler space; the model rebuilds its token layout for the longer stream."""
+    levels = sigmas[:-1].tolist()
+
+    def wrapper(executor, x, t, c_concat, c_crossattn, control, transformer_options, **kwargs):
+        sigma = float(t.flatten()[0])
+        if min(range(len(levels)), key=lambda i: abs(levels[i] - sigma)) + 1 < from_step:
+            return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+        streams = comfy.utils.unpack_latents(x, kwargs["latent_shapes"])
+        streams[0] = torch.cat((streams[0], anchor.to(streams[0]).expand(streams[0].shape[0], -1, -1, -1, -1)), dim=2)
+        x, kwargs["latent_shapes"] = comfy.utils.pack_latents(streams)
+        mask = kwargs["denoise_mask"]
+        kwargs["denoise_mask"] = torch.cat((mask, torch.zeros_like(mask[:, :, :1])), dim=2)
+        out = comfy.utils.unpack_latents(executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs), kwargs["latent_shapes"])
+        out[0] = out[0][:, :, :-1]
+        return comfy.utils.pack_latents(out)[0]
+    return wrapper
+
+
 class MouthPassWriter:
     """Restores the mouth of every decoded uint8 chunk before the encoder receives it."""
 
@@ -112,6 +148,21 @@ class SEH3LongLipSync:
             "mouth_blend": ("FLOAT", {"default": .7, "min": 0, "max": 1, "step": .01, "tooltip": "Feathered mouth-only blend. 0 leaves every frame unchanged."}),
             "mouth_model": ("STRING", {"default": "codeformer.pth", "tooltip": "Existing file under models/facerestore_models. No automatic download."}),
             "mouth_detector": ("STRING", {"default": "models/buffalo_l/det_10g.onnx", "tooltip": "Existing SCRFD detector under models/insightface. No automatic download."}),
+            "context_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": (
+                "Anti-drift, 0 = off. The model sees the held overlap partly noisy instead of perfectly clean: its latents get partial "
+                "denoise masks from this value at the window's far start down to 0 at the join with the new frames (the first and the join "
+                "latent stay exact). The real overlap is kept afterwards, so joins stay exact. 0.8 is the only community-tested value; "
+                "it kept texture but darkened colour on a static shot.")}),
+            "keystone": ("BOOLEAN", {"default": False, "tooltip": (
+                "Anti-drift. Locks the first window's first latent (frame 0) into the first slot of every later window as an identity and "
+                "colour anchor while sampling. The video keeps its real frame there, so nothing is duplicated. Suits locked-camera avatars; "
+                "it pulls moving-camera shots back toward the first window's framing.")}),
+            "capstone_from_step": ("INT", {"default": 0, "min": 0, "max": 100, "tooltip": (
+                "Anti-drift, 0 = off. From this sampling step on (counted from 1), the first window's last single-frame latent is attached "
+                "locked after every later window as an end anchor and cut off again; it never reaches the output. The earlier steps let the "
+                "window choose its own pose. The community-tested setting is step 5 of 8 (the second half of the schedule): use 5 with "
+                "8 steps and 3 with 4-step Turbo, which starts at the same noise level. A value above the step count does nothing. "
+                "Keep FirstBlockCache off with it: the token count changes at that step.")}),
         }}
 
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
@@ -125,7 +176,8 @@ class SEH3LongLipSync:
     def generate(self, model, positive, latent, audio, audio_vae, video_vae, seed, steps,
                  window_frames="243", overlap_frames="39", filename_prefix="video/H3_Long_Lip_Sync/Avatar", video_crf=17,
                  mouth_pass=False, mouth_fidelity=.9, mouth_blend=.7,
-                 mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", decode_vae=None):
+                 mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", decode_vae=None,
+                 context_noise=0.0, keystone=False, capstone_from_step=0):
         mouth_pass = bool(mouth_pass) and mouth_blend != 0
         if mouth_pass:
             # Fail before sampling, not after a long generation, when a mouth model is missing.
@@ -159,19 +211,19 @@ class SEH3LongLipSync:
         video = torch.zeros((1, 24, total_steps, height // 16, width // 16), dtype=torch.float32)
         sampler = comfy.samplers.ksampler("euler")
         sigmas = BasicScheduler.execute(model, "simple", int(steps), 1.0).args[0]
+        capstone = len(plan) > 1 and 0 < int(capstone_from_step) <= int(steps)
         report = {"method": "native masked latent continuation", "seconds": seconds, "canvas": [width, height],
                   "seed": seed, "steps": steps, "window_frames": int(window_frames), "overlap_frames": int(overlap_frames),
-                  "audio_mode": "locked source + clean audio guide", "chunks": [], "timing": {}}
+                  "audio_mode": "locked source + clean audio guide", "chunks": [], "timing": {},
+                  "anti_drift": {"context_noise": context_noise, "keystone": bool(keystone), "capstone_from_step": int(capstone_from_step)}}
         progress = comfy.utils.ProgressBar(len(plan))
         sampling_start = time.perf_counter()
         for index, span in enumerate(plan):
             mm.throw_exception_if_processing_interrupted()
             start = time.perf_counter()
-            s, e = span["start_latent"], span["end_latent"]
+            s, e, held = span["start_latent"], span["end_latent"], span["held_latents"]
             av = encoded[..., span["audio_start"]:span["audio_end"]]
-            v = video[:, :, s:e].clone()
-            vm = torch.ones((1, 1, e - s, 1, 1), dtype=v.dtype)
-            vm[:, :, :span["held_latents"]] = 0
+            v, vm = window_latents(video, span, context_noise, keystone)
             # Audio also informs the model as a clean guide, as in the accepted
             # short lip-sync preset. The final file always uses the source WAV.
             mask = comfy.nested_tensor.NestedTensor((vm, torch.zeros((1, 1, 2, av.shape[-1]), dtype=av.dtype)))
@@ -179,24 +231,34 @@ class SEH3LongLipSync:
             cond = window_conditioning(positive, av, continuation=index > 0)
             guider = BasicGuider.execute(model, cond).args[0]
             noise = RandomNoise.execute((int(seed) + index) % (1 << 64)).args[0]
-            LOG.info("[H3 Long Lip Sync] chunk %d/%d: frames %d..%d, audio ticks %d..%d", index + 1, len(plan),
-                     span["start_frame"], span["end_frame"], span["audio_start"], span["audio_end"])
+            applied = [label for label, on in ((f"context noise {context_noise:g}", context_noise), ("keystone", keystone),
+                                               (f"capstone from step {capstone_from_step}/{steps}", capstone)) if held and on]
+            LOG.info("[H3 Long Lip Sync] chunk %d/%d: frames %d..%d, audio ticks %d..%d, anti-drift: %s", index + 1, len(plan),
+                     span["start_frame"], span["end_frame"], span["audio_start"], span["audio_end"], ", ".join(applied) or "off")
             out = SamplerCustomAdvanced.execute(noise, guider, sampler, sigmas, work).args[0]
             generated, generated_audio = out["samples"].unbind()
-            held = span["held_latents"]
-            held_out = generated[:, :, :held].cpu()
+            # Context-noise rows are partly resampled; every row still masked 0 must come back unchanged.
+            locked = vm[0, 0, :held, 0, 0] == 0
+            held_in = v[:, :, :held][:, :, locked]
+            held_out = generated[:, :, :held].cpu()[:, :, locked]
             audio_out = generated_audio.cpu()
-            overlap_error = (held_out - v[:, :, :held]).abs().max().item() if held else 0.0
+            overlap_error = (held_out - held_in).abs().max().item() if held else 0.0
             audio_error = (audio_out - av).abs().max().item()
             # Native latent normalization makes a float32 round trip. Validate
             # that only its rounding changed held samples, then retain the exact
             # original overlap below (never overwrite it with the round trip).
-            if not torch.allclose(held_out, v[:, :, :held], atol=1e-5, rtol=1e-5) or not torch.allclose(audio_out, av, atol=1e-5, rtol=1e-5):
+            if not torch.allclose(held_out, held_in, atol=1e-5, rtol=1e-5) or not torch.allclose(audio_out, av, atol=1e-5, rtol=1e-5):
                 raise RuntimeError(f"Native H3 masks changed held samples: overlap max error {overlap_error:g}, audio {audio_error:g}")
             video[:, :, s + held:e] = generated[:, :, held:].cpu()
+            if index == 0 and capstone:
+                cap = 5 * ((e - 1) // 5)  # the first window's last single-frame latent
+                model = model.clone()
+                model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.APPLY_MODEL, "se_h3_capstone",
+                                           capstone_wrapper(video[:, :, cap:cap + 1].clone(), sigmas, int(capstone_from_step)))
             report["chunks"].append({**span, "seed": noise.seed, "seconds": time.perf_counter() - start,
                                      "overlap_retained_exactly": True, "encoded_audio_mask_preserved": True,
-                                     "sampler_overlap_max_abs": overlap_error, "sampler_audio_max_abs": audio_error})
+                                     "sampler_overlap_max_abs": overlap_error, "sampler_audio_max_abs": audio_error,
+                                     "anti_drift": applied})
             progress.update(index + 1)
         report["timing"]["sampling_seconds"] = time.perf_counter() - sampling_start
         output_root = folder_paths.get_output_directory()

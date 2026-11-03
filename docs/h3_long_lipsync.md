@@ -10,6 +10,16 @@ The H3 video and audio grids meet every 51 video frames (24 fps / 40 audio ticks
 
 The first-frame FL2VA anchor applies to the first window. Later windows inherit the held latents. Ref2VA identity references remain in conditioning. Sampling uses Euler/simple, CFG 1 and the connected step count; choose the corresponding Turbo LoRA, or a suitable quality step count without Turbo.
 
+## Anti-drift switches
+
+Three optional inputs at the end of the node, all off by default; off reproduces the previous results exactly. They act from the second window on, and each window logs the switches it applied (also listed per chunk in the JSON report). The method comes from roycho87's Geiru Context Suite and NerdNotes (context noise credited there to ethanfel/Lumifel); this is our own implementation on the 51-frame grid.
+
+- `context_noise` (0 to 1): the held overlap latents get partial denoise masks, from this value at the window's far start down to 0 at the join with the new frames, so the model sees them partly noisy. Latent 0 and the join latent stay exact. With 39 held frames (12 latents) and 0.8, latents 1 to 11 get 0.80, 0.72 ... 0.08, 0. The video keeps the original overlap latents, so joins stay exact.
+- `keystone`: the first window's latent 0 (frame 0) replaces the window's held latent 0 while sampling. The video keeps the real latent there, so no frame is duplicated.
+- `capstone_from_step` (0 = off): from this sampling step on (counted from 1), the first window's last single-frame latent is attached, locked, after the window's last video latent for every model call and cut off the prediction. It never reaches the output and adds no frames. The tested setting was step 5 of 8; on our Euler/simple schedule step 3 of 4 starts at the same noise level. Keep FirstBlockCache off with it, because the token count changes at that step.
+
+The community measurements are single runs on 8-step er_sde/beta Ref2VA chains with a locked or tracking camera: all three together reduced colour drift and grit over 10 to 50 eight-second clips, while context noise alone darkened a static shot. Keystone and capstone pull every window toward the first window's framing, which suits locked-camera avatars and hurts camera moves. They are not yet A/B-tested on our long lip-sync review set; review results before enabling them in a preset.
+
 ## Outputs and limitations
 
 The node produces VIDEO, a file path and a JSON report, plus an MP4 preview. Files include the final H.264/AAC video, decoded video-only intermediate, normalized source PCM WAV and timings/overlap checks. The final soundtrack follows the complete driving audio at its original speed; normalization/resampling and AAC export mean it is not a bit-identical copy of the original file. No generated audio replaces the driving narration.

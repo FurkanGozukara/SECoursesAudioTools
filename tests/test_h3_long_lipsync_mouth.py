@@ -35,7 +35,7 @@ class MouthPassWriterTests(TestCase):
 
     def test_mouth_inputs_are_optional_and_off_by_default(self):
         optional = ll.SEH3LongLipSync.INPUT_TYPES()["optional"]
-        self.assertEqual(set(optional), {"mouth_pass", "mouth_fidelity", "mouth_blend", "mouth_model", "mouth_detector"})
+        self.assertLessEqual({"mouth_pass", "mouth_fidelity", "mouth_blend", "mouth_model", "mouth_detector"}, set(optional))
         self.assertFalse(optional["mouth_pass"][1]["default"])
 
     def test_missing_mouth_model_fails_before_sampling(self):

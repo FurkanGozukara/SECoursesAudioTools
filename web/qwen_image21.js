@@ -121,7 +121,7 @@ function configure(node) {
     ui.continuationRow.style.display = "none";
     ui.mergeToggle.style.setProperty("display", "none", "important");
     for (const widget of node.widgets ?? []) {
-        if (["video_fps", "max_seconds", "match_batch_init_media"].includes(widget.name)) {
+        if (["video_fps", "max_seconds", "match_batch_init_media", "downscale_videos"].includes(widget.name)) {
             widget.hidden = true;
             widget.computeSize = () => [0, -4];
         }

@@ -14,6 +14,12 @@ const PROFILES = {
         hint: "Add, paste, remove or reorder images. One image: edit it. Several: refer to them as image 1, image 2 in the instruction. The result has the first image's size.",
         empty: "Images to edit: add, drop or paste. The first image sets the result size.",
     },
+    // MiniMax H3 Image: SEH3ImagePromptEnhance + SEH3ImageGalleryEncode
+    h3_image_images: {
+        hint: "Add, paste, remove or reorder up to 16 images. Empty gallery = text to image. With images, image 1 is the one edited; name the others as @image2, @image3 in the instruction.",
+        empty: "Optional images to edit: add, drop or paste up to 16. Leave empty for text to image.",
+        counter: count => `${count} / 16 images (empty = text to image)`,
+    },
 };
 
 function configureGallery(node) {
@@ -26,7 +32,7 @@ function configureGallery(node) {
         ui.render = () => {
             render();
             const count = ui.state.images.length;
-            ui.counter.textContent = `${count} image${count === 1 ? "" : "s"} to edit (up to 4 recommended)`;
+            ui.counter.textContent = profile.counter ? profile.counter(count) : `${count} image${count === 1 ? "" : "s"} to edit (up to 4 recommended)`;
             ui.soundtrackHint.style.setProperty("display", "none", "important");
         };
     }
@@ -43,7 +49,7 @@ function configureGallery(node) {
     ui.continuationRow.style.display = "none";
     ui.mergeToggle.style.setProperty("display", "none", "important");
     for (const widget of node.widgets ?? []) {
-        if (["video_fps", "max_seconds", "match_batch_init_media"].includes(widget.name)) {
+        if (["video_fps", "max_seconds", "match_batch_init_media", "downscale_videos"].includes(widget.name)) {
             widget.hidden = true;
             widget.computeSize = () => [0, -4];
         }

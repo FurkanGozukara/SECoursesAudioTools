@@ -151,6 +151,32 @@ def run_enhancer(clip, prompt, images, seed, thinking=True):
     return parsed["expanded_caption"].strip(), parsed.get(ratio_key) or parsed.get("aspect_ratio"), answer
 
 
+def enhance_prompt(enhance, clip, prompt, images, seed, node):
+    """(prompt the model receives, enhancer aspect ratio or None) for an ENHANCE_MODES choice."""
+    if enhance not in ENHANCE_MODES:
+        raise ValueError(f"Unknown enhancer mode: {enhance}")
+    if enhance == ENHANCE_MODES[2]:
+        return prompt, None
+    caption, ratio, answer = run_enhancer(clip, prompt, images, seed, thinking=enhance == ENHANCE_MODES[0])
+    if caption is None:
+        print(f"[{node}] the enhancer gave no caption, so your prompt is used as written. Answer: {answer[-600:]!r}", flush=True)
+        return prompt, None
+    return caption, ratio
+
+
+def result_size(size_mode, ratio, first_image, width, height):
+    """Exact: width x height. Auto: that pixel area at the enhancer's ratio, else image 1's shape, else width x height's."""
+    if size_mode not in SIZE_MODES:
+        raise ValueError(f"Unknown size mode: {size_mode}")
+    width, height = int(width), int(height)
+    if size_mode == SIZE_MODES[1]:
+        return width, height
+    ratio = parse_ratio(ratio)
+    if ratio is None:
+        ratio = first_image.shape[2] / first_image.shape[1] if first_image is not None else width / height
+    return size_for(ratio, width * height)
+
+
 class SEH3ImagePromptEnhance:
     @classmethod
     def INPUT_TYPES(cls):
@@ -177,19 +203,11 @@ class SEH3ImagePromptEnhance:
         return ["enhancer_clip"] if enhance != ENHANCE_MODES[2] and enhancer_clip is None else []
 
     def run(self, references, enhance, seed, enhancer_clip=None):
-        if enhance not in ENHANCE_MODES:
-            raise ValueError(f"Unknown enhancer mode: {enhance}")
         images = gallery_images(references)
         prompt = prepare_prompt(references.get("prompt", ""), seed, len(images))
         if not prompt:
             raise ValueError("Write a prompt first: what to create, or for images, what to change.")
-        ratio = None
-        if enhance != ENHANCE_MODES[2]:
-            caption, ratio, answer = run_enhancer(enhancer_clip, prompt, images, seed, thinking=enhance == ENHANCE_MODES[0])
-            if caption is None:
-                print(f"[SEH3ImagePromptEnhance] the enhancer gave no caption, so your prompt is used as written. Answer: {answer[-600:]!r}", flush=True)
-            else:
-                prompt = caption
+        prompt, ratio = enhance_prompt(enhance, enhancer_clip, prompt, images, seed, "SEH3ImagePromptEnhance")
         print(f"[SEH3ImagePromptEnhance] {len(images)} image(s), aspect {ratio or 'from size'}; prompt: {prompt[:400]!r}", flush=True)
         return (dict(references, prompt=prompt, h3_image_aspect=ratio), prompt)
 
@@ -221,15 +239,8 @@ class SEH3ImageGalleryEncode:
     def encode(self, clip, vae, references, width, height, size_mode, batch_size=1):
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageConditioning
 
-        if size_mode not in SIZE_MODES:
-            raise ValueError(f"Unknown size mode: {size_mode}")
         images = gallery_images(references)
-        width, height = int(width), int(height)
-        if size_mode == SIZE_MODES[0]:
-            ratio = parse_ratio(references.get("h3_image_aspect"))
-            if ratio is None:
-                ratio = images[0].shape[2] / images[0].shape[1] if images else width / height
-            width, height = size_for(ratio, width * height)
+        width, height = result_size(size_mode, references.get("h3_image_aspect"), images[0] if images else None, width, height)
         positive, latent = MiniMaxH3ImageConditioning.execute(
             clip=clip, prompt=references.get("prompt", ""), width=width, height=height, vae=vae,
             images={f"image_{i + 1}": image for i, image in enumerate(images)}).args
@@ -239,8 +250,50 @@ class SEH3ImageGalleryEncode:
         return (positive, latent)
 
 
-NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in (SEH3ImagePromptEnhance, SEH3ImageGalleryEncode)}
+class SEH3ImageSwarmEnhance:
+    """The SwarmUI side of the presets (SwarmUI_Premium_Extensions/MiniMaxH3Image): the same prompt preparation, official
+    enhancer and Auto size as the gallery nodes, for SwarmUI's native MiniMax H3 Image workflow. Its outputs replace the
+    text of SwarmUI's encode node and the size of its empty latent."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "tooltip": "SwarmUI's processed prompt; @image1 is the first prompt image."}),
+                "enhance": (ENHANCE_MODES,),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "width": ("INT", {"default": 4096, "min": 256, "max": 16384, "step": 32}),
+                "height": ("INT", {"default": 4096, "min": 256, "max": 16384, "step": 32}),
+                "size_mode": (SIZE_MODES,),
+            },
+            "optional": {
+                "enhancer_clip": ("CLIP", {"lazy": True}),
+                "minimax_refs": ("MiniMaxReferences", {"tooltip": "SwarmUI's MiniMax H3 Image references (the prompt images)."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT")
+    RETURN_NAMES = ("prompt", "width", "height")
+    FUNCTION = "run"
+    CATEGORY = "SECourses/MiniMax H3 Image"
+
+    def check_lazy_status(self, prompt, enhance, seed, width, height, size_mode, enhancer_clip=None, minimax_refs=None):
+        return ["enhancer_clip"] if enhance != ENHANCE_MODES[2] and enhancer_clip is None else []
+
+    def run(self, prompt, enhance, seed, width, height, size_mode, enhancer_clip=None, minimax_refs=None):
+        images = [item["data"] for item in (minimax_refs or {}).get("ref_items", []) if item["type"] == "image"]
+        prompt = prepare_prompt(prompt, seed, len(images))
+        if not prompt:
+            raise ValueError("Write a prompt first: what to create, or for images, what to change.")
+        prompt, ratio = enhance_prompt(enhance, enhancer_clip, prompt, images, seed, "SEH3ImageSwarmEnhance")
+        width, height = result_size(size_mode, ratio, images[0] if images else None, width, height)
+        print(f"[SEH3ImageSwarmEnhance] {len(images)} image(s), {width}x{height}; prompt: {prompt[:400]!r}", flush=True)
+        return (prompt, width, height)
+
+
+NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in (SEH3ImagePromptEnhance, SEH3ImageGalleryEncode, SEH3ImageSwarmEnhance)}
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SEH3ImagePromptEnhance": "MiniMax H3 Image Prompt Enhance (Gallery)",
     "SEH3ImageGalleryEncode": "MiniMax H3 Image Gallery Encode",
+    "SEH3ImageSwarmEnhance": "MiniMax H3 Image Prompt Enhance (SwarmUI)",
 }

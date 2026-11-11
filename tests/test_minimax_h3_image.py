@@ -93,7 +93,7 @@ class EnhancerMessageTests(unittest.TestCase):
         self.assertIn("User Aspect Ratio Selection:\nadaptive", text)
 
 
-class NodeTests(unittest.TestCase):
+class FakeEnhancer(unittest.TestCase):
     def setUp(self):
         self.calls = []
 
@@ -106,6 +106,8 @@ class NodeTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+
+class NodeTests(FakeEnhancer):
     def test_lazy_enhancer_clip(self):
         node = h3i.SEH3ImagePromptEnhance()
         self.assertEqual(node.check_lazy_status({}, h3i.ENHANCE_MODES[0], 0), ["enhancer_clip"])
@@ -152,6 +154,36 @@ class NodeTests(unittest.TestCase):
         with patch("comfy_extras.nodes_textgen.TextGenerateV2.execute", return_value=io.NodeOutput("", "cut off")):
             pack, prompt = h3i.SEH3ImagePromptEnhance().run({"prompt": "a fox"}, h3i.ENHANCE_MODES[0], 0, enhancer_clip=object())
         self.assertEqual((prompt, pack["h3_image_aspect"]), ("a fox", None))
+
+
+class SwarmNodeTests(FakeEnhancer):
+    def refs(self, *images):
+        return {"ref_items": [{"type": "image", "data": i} for i in images], "ref_blocks": [], "picture_label": "Picture %d: "}
+
+    def test_lazy_enhancer_clip(self):
+        node = h3i.SEH3ImageSwarmEnhance()
+        self.assertEqual(node.check_lazy_status("p", h3i.ENHANCE_MODES[0], 0, 4096, 4096, h3i.SIZE_MODES[0]), ["enhancer_clip"])
+        self.assertEqual(node.check_lazy_status("p", h3i.ENHANCE_MODES[2], 0, 4096, 4096, h3i.SIZE_MODES[0]), [])
+
+    def test_text_to_image_takes_the_enhancer_ratio(self):
+        out = h3i.SEH3ImageSwarmEnhance().run("a fox", h3i.ENHANCE_MODES[0], 5, 4096, 4096, h3i.SIZE_MODES[0], enhancer_clip=object())
+        self.assertEqual(out, ("A detailed caption.", 5472, 3072))
+        self.assertNotIn("images", self.calls[0])
+
+    def test_edit_reads_swarm_references(self):
+        out = h3i.SEH3ImageSwarmEnhance().run("Turn @image1 into winter", h3i.ENHANCE_MODES[0], 1, 4096, 4096, h3i.SIZE_MODES[1],
+                                               enhancer_clip=object(), minimax_refs=self.refs(image(1536, 1024), image(1024, 1024)))
+        self.assertEqual(out, ("A detailed caption.", 4096, 4096))
+        self.assertIn('"Turn <Picture 1> into winter"', self.calls[0]["prompt"])
+        self.assertEqual(list(self.calls[0]["images"]), ["image1", "image2"])
+
+    def test_off_keeps_image_1_shape(self):
+        out = h3i.SEH3ImageSwarmEnhance().run("Make @image1 (snowy:1.2)", h3i.ENHANCE_MODES[2], 0, 4096, 4096, h3i.SIZE_MODES[0],
+                                               minimax_refs=self.refs(image(1536, 1024)))
+        self.assertEqual(out, ("Make <Picture 1> snowy", *h3i.size_for(1.5, 4096 * 4096)))
+        self.assertEqual(self.calls, [])
+        with self.assertRaisesRegex(ValueError, "no matching"):
+            h3i.SEH3ImageSwarmEnhance().run("@image2", h3i.ENHANCE_MODES[2], 0, 4096, 4096, h3i.SIZE_MODES[0], minimax_refs=self.refs(image(64, 64)))
 
 
 class EncodeTests(unittest.TestCase):

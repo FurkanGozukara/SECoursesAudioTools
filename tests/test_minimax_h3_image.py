@@ -151,9 +151,18 @@ class NodeTests(FakeEnhancer):
             h3i.SEH3ImagePromptEnhance().run({"prompt": "  "}, h3i.ENHANCE_MODES[2], 0)
 
     def test_unparsable_answer_keeps_the_prompt(self):
-        with patch("comfy_extras.nodes_textgen.TextGenerateV2.execute", return_value=io.NodeOutput("", "cut off")):
+        with patch("comfy_extras.nodes_textgen.TextGenerateV2.execute", return_value=io.NodeOutput("", "cut off")) as generate:
             pack, prompt = h3i.SEH3ImagePromptEnhance().run({"prompt": "a fox"}, h3i.ENHANCE_MODES[0], 0, enhancer_clip=object())
         self.assertEqual((prompt, pack["h3_image_aspect"]), ("a fox", None))
+        self.assertEqual([c.kwargs["thinking"] for c in generate.call_args_list], [True, False])
+
+    def test_reasoning_without_answer_falls_back_to_fast(self):
+        answers = [io.NodeOutput("", "ran out of tokens"), io.NodeOutput('{"expanded_caption": "Fast caption.", "target_aspect_ratio": "3:2"}', "")]
+        refs = {"prompt": "Make @image1 snowy", "image_tensors": [image(64, 64)]}
+        with patch("comfy_extras.nodes_textgen.TextGenerateV2.execute", side_effect=answers) as generate:
+            pack, prompt = h3i.SEH3ImagePromptEnhance().run(refs, h3i.ENHANCE_MODES[0], 0, enhancer_clip=object())
+        self.assertEqual((prompt, pack["h3_image_aspect"]), ("Fast caption.", "3:2"))
+        self.assertEqual([c.kwargs["thinking"] for c in generate.call_args_list], [True, False])
 
 
 class SwarmNodeTests(FakeEnhancer):

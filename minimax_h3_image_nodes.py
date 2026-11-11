@@ -158,6 +158,10 @@ def enhance_prompt(enhance, clip, prompt, images, seed, node):
     if enhance == ENHANCE_MODES[2]:
         return prompt, None
     caption, ratio, answer = run_enhancer(clip, prompt, images, seed, thinking=enhance == ENHANCE_MODES[0])
+    if caption is None and enhance == ENHANCE_MODES[0]:
+        # Seen on edits: the reasoning ran out of tokens or ended without the JSON answer. The fast mode still answers.
+        print(f"[{node}] the reasoning enhancer gave no caption, so the fast enhancer writes it. Answer: {answer[-300:]!r}", flush=True)
+        caption, ratio, answer = run_enhancer(clip, prompt, images, seed, thinking=False)
     if caption is None:
         print(f"[{node}] the enhancer gave no caption, so your prompt is used as written. Answer: {answer[-600:]!r}", flush=True)
         return prompt, None

@@ -195,6 +195,21 @@ class SwarmNodeTests(FakeEnhancer):
             h3i.SEH3ImageSwarmEnhance().run("@image2", h3i.ENHANCE_MODES[2], 0, 4096, 4096, h3i.SIZE_MODES[0], minimax_refs=self.refs(image(64, 64)))
 
 
+class TextToImageOnlyTests(unittest.TestCase):
+    def test_images_stop_a_text_to_image_only_run(self):
+        node = h3i.SEH3ImagePromptEnhance()
+        refs = {"prompt": "p", "image_tensors": [image(64, 64)]}
+        with self.assertRaisesRegex(ValueError, "text to image only"):
+            node.run(refs, h3i.ENHANCE_MODES[2], 0, text_to_image_only=True)
+
+    def test_default_and_empty_gallery_run_unchanged(self):
+        node = h3i.SEH3ImagePromptEnhance()
+        refs = {"prompt": "p", "image_tensors": [image(64, 64)]}
+        self.assertEqual(node.run(refs, h3i.ENHANCE_MODES[2], 0)[1], "p")
+        self.assertEqual(node.run({"prompt": "p"}, h3i.ENHANCE_MODES[2], 0, text_to_image_only=True)[1], "p")
+        self.assertEqual(node.check_lazy_status({"prompt": "p"}, h3i.ENHANCE_MODES[2], 0, text_to_image_only=True), [])
+
+
 class EncodeTests(unittest.TestCase):
     def run_encode(self, refs, width, height, mode, batch=1):
         seen = {}

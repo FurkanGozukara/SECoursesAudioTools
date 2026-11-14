@@ -192,6 +192,7 @@ class SEH3ImagePromptEnhance:
             },
             "optional": {
                 "enhancer_clip": ("CLIP", {"lazy": True, "tooltip": "Qwen3.5 9B (Load CLIP, any type except moss_image). Loaded only when the enhancer is On."}),
+                "text_to_image_only": ("BOOLEAN", {"default": False, "tooltip": "On in text-to-image-only presets (KJNodes empty image): gallery images stop the run with a message instead of being ignored. Use the Image Edit preset for images."}),
             },
         }
 
@@ -203,11 +204,14 @@ class SEH3ImagePromptEnhance:
                    "enhancer On the official MiniMax prompt enhancer on a local Qwen3.5 9B (text to image, or editing with up to "
                    "16 gallery images). The prompt output is the exact text the model receives.")
 
-    def check_lazy_status(self, references, enhance, seed, enhancer_clip=None):
+    def check_lazy_status(self, references, enhance, seed, enhancer_clip=None, text_to_image_only=False):
         return ["enhancer_clip"] if enhance != ENHANCE_MODES[2] and enhancer_clip is None else []
 
-    def run(self, references, enhance, seed, enhancer_clip=None):
+    def run(self, references, enhance, seed, enhancer_clip=None, text_to_image_only=False):
         images = gallery_images(references)
+        if text_to_image_only and images:
+            raise ValueError("This preset is text to image only (KJNodes empty image). Remove the gallery images, or use the "
+                             "MiniMax H3 Image Image Edit preset to edit them.")
         prompt = prepare_prompt(references.get("prompt", ""), seed, len(images))
         if not prompt:
             raise ValueError("Write a prompt first: what to create, or for images, what to change.")

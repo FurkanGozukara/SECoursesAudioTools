@@ -30,6 +30,12 @@ CANVAS_MULTIPLE = 32
 SAMPLING = {"sampling_mode": "on", "temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
             "repetition_penalty": 1.0, "presence_penalty": 0.0}
 MAX_TOKENS = 8192
+# A fixed speculative-decoding (multi-token prediction) mode for the Qwen3.5 enhancer, whose files carry MTP heads. ComfyUI's
+# default "auto" reshapes its draft tree from measured step times, so the same seed wrote different captions whenever the
+# timing varied (other jobs, --use-sage-attention). Measured 2026-11-14 on an RTX A6000, reasoning mode: every fixed mode
+# repeated its caption exactly (also 3 of 3 with --use-sage-attention and two servers at once); "4" was the fastest
+# (28-31 s against 32 s for auto, 42-49 s for 2/3, 88 s with MTP off).
+ENHANCER_MTP = "4"
 VISION_START, IMAGE_PAD, VISION_END = "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"
 
 
@@ -138,11 +144,11 @@ def run_enhancer(clip, prompt, images, seed, thinking=True):
         vision_mp = min(1.0, 4.0 / len(images))
         vision = {f"image{i + 1}": scaled_for_vision(image, vision_mp) for i, image in enumerate(images)}
         result = TextGenerateV2.execute(clip=clip, prompt=edit_message(prompt, images, "adaptive", thinking), max_length=MAX_TOKENS,
-                                        sampling_mode=sampling, thinking=thinking, images=vision)
+                                        sampling_mode=sampling, thinking=thinking, images=vision, mtp=ENHANCER_MTP)
         ratio_key = "target_aspect_ratio"
     else:
         result = TextGenerateV2.execute(clip=clip, prompt=read_pe("t2i_task_prompt.txt").format(prompt), max_length=MAX_TOKENS,
-                                        sampling_mode=sampling, thinking=thinking, system_prompt=read_pe("t2i_system_prompt.txt").rstrip("\n"))
+                                        sampling_mode=sampling, thinking=thinking, system_prompt=read_pe("t2i_system_prompt.txt").rstrip("\n"), mtp=ENHANCER_MTP)
         ratio_key = "aspect_ratio"
     answer = result.args[0]
     parsed = parse_answer(answer)

@@ -18,6 +18,10 @@ MiniMax H3 Image is a 33B diffusion transformer of the MiniMax H3 family (H3 wit
 
 Seconds per image with the models loaded, including text encoding and decoding; the caps use ComfyUI's `--reserve-vram` on the same card (peaks 25.5, 18.0 and 13.1 GB), the rest streams from system RAM (96 GB here). The enhancer runs once per new prompt: about 60 s with reasoning (about 5,000 tokens at about 80 tokens/s), about 6 s in the fast mode.
 
+## Fixed seed, same caption (2026-11-14)
+
+The Qwen3.5 9B enhancer files carry multi-token-prediction heads, and ComfyUI's Generate Text uses them with `mtp="auto"`, which reshapes its draft tree from measured step times. Whenever the timing varied (another job on the machine, `--use-sage-attention` in our Windows launchers) the same seed wrote a different caption, and so a different image: two runs of the shipped Text To Image preset on the RTX 5090 differed. The enhancer now passes a fixed mode (`ENHANCER_MTP = "4"`). On an RTX A6000 every fixed mode repeated its caption exactly, also 3 of 3 under `--use-sage-attention` with two servers running at once, and mode 4 was the fastest (reasoning 28-31 s against 32 s for auto, 42-49 s for 2 and 3, 88 s with MTP off). Captions differ from the earlier auto ones (another sampling path, same instructions and settings); `text_to_image_only` (optional, default False) guards the KJNodes Empty Image preset against gallery images.
+
 ## Validation, 2026-11-10
 
 ComfyUI `989d93d0` (v0.45.0), frontend 1.58.5, physical GPU 0 (RTX 5090); remote probes on RTX A6000.

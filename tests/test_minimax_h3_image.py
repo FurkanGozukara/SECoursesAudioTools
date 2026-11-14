@@ -136,6 +136,9 @@ class NodeTests(FakeEnhancer):
         self.assertEqual(call["system_prompt"], h3i.read_pe("t2i_system_prompt.txt").rstrip("\n"))
         self.assertEqual(call["sampling_mode"]["seed"], 5)
         self.assertEqual(call["max_length"], h3i.MAX_TOKENS)
+        # a fixed speculative-decoding mode: "auto" adapts to measured timings and broke fixed-seed captions
+        self.assertEqual(call["mtp"], h3i.ENHANCER_MTP)
+        self.assertNotEqual(h3i.ENHANCER_MTP, "auto")
 
     def test_edit_uses_the_gallery_images(self):
         refs = {"prompt": "Turn @image1 into winter", "image_tensors": [image(3000, 2000), image(640, 480)]}
@@ -145,6 +148,7 @@ class NodeTests(FakeEnhancer):
         self.assertEqual(list(call["images"]), ["image1", "image2"])
         self.assertLessEqual(call["images"]["image1"].shape[1] * call["images"]["image1"].shape[2], 1_000_000 + 4000)
         self.assertEqual(pack["h3_image_aspect"], "16:9")
+        self.assertEqual(call["mtp"], h3i.ENHANCER_MTP)
 
     def test_empty_prompt(self):
         with self.assertRaisesRegex(ValueError, "Write a prompt"):

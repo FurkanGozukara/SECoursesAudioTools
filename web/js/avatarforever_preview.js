@@ -11,7 +11,7 @@ function findNode(executionId) {
 }
 
 function installPanel(node) {
-    if (node.comfyClass !== "SEAvatarForeverPreview" || node[PANEL]) return;
+    if (!["SEAvatarForeverPreview", "SELongCatAvatarPreview"].includes(node.comfyClass) || node[PANEL]) return;
 
     const root = document.createElement("div");
     root.style.cssText = "display:flex;flex-direction:column;gap:8px;width:100%;height:100%;padding:8px;box-sizing:border-box;color:#e4eee9;font:14px sans-serif;";

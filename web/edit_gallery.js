@@ -20,6 +20,14 @@ const PROFILES = {
         empty: "Optional images to edit: add, drop or paste up to 16. Leave empty for text to image.",
         counter: count => `${count} / 16 images (empty = text to image)`,
     },
+    // LongCat Avatar 1.6: SELongCatAvatarInputs (prompt box + optional identity photo + folder batches)
+    longcat_avatar: {
+        hint: "Optional: add the person's photo here (@image1) instead of 2. OPTIONAL IMAGE. + Prompt makes one video per prompt. A folder batch pairs name.txt with name.png/jpg and name.wav/mp3.",
+        empty: "Optional identity photo (@image1). Or use 2. OPTIONAL IMAGE, or no photo for audio + text.",
+        counter: count => `${count} photo${count === 1 ? "" : "s"} (the first one is used)`,
+        button: "+ Add identity photo",
+        keep: ["match_batch_init_media"],
+    },
 };
 
 function configureGallery(node) {
@@ -37,7 +45,7 @@ function configureGallery(node) {
         };
     }
     ui.fileInput.accept = "image/*";
-    ui.addButton.textContent = "+ Add images to edit";
+    ui.addButton.textContent = profile.button ?? "+ Add images to edit";
     ui.addButton.title = profile.hint;
     ui.root.classList.add("secourses-flux3-gallery");
     ui.minContentHeight = () => 360;
@@ -49,7 +57,8 @@ function configureGallery(node) {
     ui.continuationRow.style.display = "none";
     ui.mergeToggle.style.setProperty("display", "none", "important");
     for (const widget of node.widgets ?? []) {
-        if (["video_fps", "max_seconds", "match_batch_init_media", "downscale_videos"].includes(widget.name)) {
+        if (["video_fps", "max_seconds", "match_batch_init_media", "downscale_videos"].includes(widget.name)
+            && !(profile.keep ?? []).includes(widget.name)) {
             widget.hidden = true;
             widget.computeSize = () => [0, -4];
         }

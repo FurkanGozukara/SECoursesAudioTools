@@ -88,8 +88,44 @@ class LayerNormFP32(nn.Module):
         return F.layer_norm(x.float(), (self.dim,), weight, bias, self.eps).to(x.dtype)
 
 
+def _mod_ln_eager(x, shift, scale, eps: float = 1e-6):
+    out = F.layer_norm(x.float(), (x.shape[-1],), None, None, eps)
+    return (out * (scale + 1) + shift).to(x.dtype)
+
+
+def _gate_res_eager(x, gate, y):
+    return (x.float() + gate * y.float()).to(x.dtype)
+
+
+class _Fused:
+    """One-kernel versions of the fp32 elementwise chains (torch.compile); same math, eager fallback on any failure."""
+
+    def __init__(self, fn):
+        self.eager = fn
+        self.compiled = None
+        self.failed = False
+
+    def __call__(self, *args):
+        if not self.failed and args[0].is_cuda:
+            try:
+                if self.compiled is None:
+                    self.compiled = torch.compile(self.eager, fullgraph=True, dynamic=True)
+                return self.compiled(*args)
+            except Exception as error:  # no Triton / compiler: keep the identical eager math
+                self.failed = True
+                import logging
+                logging.warning("[LongCat-Avatar] fused kernels unavailable, using eager ops: %s", str(error)[:200])
+        return self.eager(*args)
+
+
+mod_ln = _Fused(_mod_ln_eager)
+gate_res = _Fused(_gate_res_eager)
+
+
 def _modulate(norm, x, shift, scale):
     """Official modulate_fp32: norm in fp32, x * (1 + scale) + shift, back to x.dtype."""
+    if getattr(norm, "weight", None) is None and getattr(norm, "eps", None) == 1e-6:
+        return mod_ln(x, shift, scale)
     dtype = x.dtype
     out = norm(x.to(torch.float32))
     return torch.addcmul(shift, out, scale + 1).to(dtype)
@@ -487,7 +523,7 @@ class AvatarBlock(nn.Module):
         av = attn_out.view(B, Tx, per, C)
         fstep = max(1, ROW_CHUNK // per)
         for f0, f1 in _chunks(Tx, fstep):
-            xv[:, f0:f1] = xv[:, f0:f1].float().addcmul_(gate_msa[:, f0:f1], av[:, f0:f1]).to(x.dtype)
+            xv[:, f0:f1] = gate_res(xv[:, f0:f1], gate_msa[:, f0:f1], av[:, f0:f1])
         del attn_out, av
 
         noisy_frames = T - num_cond
@@ -506,14 +542,14 @@ class AvatarBlock(nn.Module):
                 ao = self.audio_cross_attn(self.pre_video_crs_attn_norm(flat), at[:, f0:f1].reshape(B * nf, M, Ca), nf,
                                            None, human_num)
                 ao = _modulate(self.mod_norm_attn, ao.view(B, nf, per, C), a_shift[:, f0:f1], a_scale[:, f0:f1])
-                xv[:, f_off + f0:f_off + f1] = flat.float().view(B, nf, per, C).addcmul_(a_gate[:, f0:f1], ao).to(x.dtype)
+                xv[:, f_off + f0:f_off + f1] = gate_res(flat.view(B, nf, per, C), a_gate[:, f0:f1], ao)
                 del flat, ao
 
         # feed forward
         for f0, f1 in _chunks(Tx, fstep):
             xm = _modulate(self.mod_norm_ffn, xv[:, f0:f1], shift_mlp[:, f0:f1], scale_mlp[:, f0:f1])
             h = self.ffn(xm.reshape(B, -1, C)).view(B, f1 - f0, per, C)
-            xv[:, f0:f1] = xv[:, f0:f1].float().addcmul_(gate_mlp[:, f0:f1], h).to(x.dtype)
+            xv[:, f0:f1] = gate_res(xv[:, f0:f1], gate_mlp[:, f0:f1], h)
         return x
 
 

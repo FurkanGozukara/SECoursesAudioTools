@@ -307,7 +307,16 @@ class StepLoRA:
                     ups = sorted([k for k in keys if k.startswith(name + ".lora_up.blocks.")],
                                  key=lambda k: int(k.split(".lora_up.blocks.")[1].split(".")[0]))
                     if ups:
-                        up = [handle.get_tensor(k).to(device=device, dtype=dtype) for k in ups]
+                        # Official LoRAUPParallel: chunk i of the down output feeds up block i. One dense
+                        # block-diagonal matrix gives the same product in a single matmul.
+                        blocks = [handle.get_tensor(k) for k in ups]
+                        rank = down.shape[0] // len(blocks)
+                        up = torch.zeros((sum(b.shape[0] for b in blocks), down.shape[0]), dtype=dtype)
+                        row = 0
+                        for index_b, b in enumerate(blocks):
+                            up[row:row + b.shape[0], index_b * rank:(index_b + 1) * rank] = b.to(dtype)
+                            row += b.shape[0]
+                        up = up.to(device)
                     else:
                         up = handle.get_tensor(name + ".lora_up.weight").to(device=device, dtype=dtype)
                     if name + ".alpha_scale" in keys:
@@ -324,20 +333,15 @@ class StepLoRA:
 
     def _hook(self, module, inputs, output):
         x = inputs[0]
-        total = None
         for index, down, up, scale in self.modules[module]:
             mult = self.multipliers[index]
             if mult == 0.0:
                 continue
-            lx = F.linear(x.to(down.dtype), down)
-            if isinstance(up, list):
-                parts = lx.chunk(len(up), dim=-1)
-                lx = torch.cat([F.linear(p, u) for p, u in zip(parts, up)], dim=-1)
-            else:
-                lx = F.linear(lx, up)
-            delta = lx.to(output.dtype) * mult * scale
-            total = delta if total is None else total + delta
-        return output if total is None else output + total
+            xin = x if x.dtype == down.dtype else x.to(down.dtype)
+            lx = F.linear(F.linear(xin, down), up)
+            # official: org_output + lora_up(lora_down(x)) * multiplier * alpha_scale (in the activation dtype)
+            output = output.add_(lx.to(output.dtype), alpha=mult * scale) if output.dtype == lx.dtype else output + lx.to(output.dtype) * (mult * scale)
+        return output
 
     def attach(self):
         for module in self.modules:
@@ -353,8 +357,7 @@ class StepLoRA:
         for entries in self.modules.values():
             for _, down, up, _ in entries:
                 total += down.numel() * down.element_size()
-                ups = up if isinstance(up, list) else [up]
-                total += sum(u.numel() * u.element_size() for u in ups)
+                total += up.numel() * up.element_size()
         return total
 
 
@@ -626,9 +629,11 @@ class SELongCatAvatarSampler:
             comfy_attention.optimized_attention = comfy_attention.attention_pytorch
         compiled = []
         if torch_compile:
-            for i, block in enumerate(dm.blocks):
-                compiled.append((i, block))
-                dm.blocks[i] = torch.compile(block, fullgraph=False, dynamic=False)
+            # Compile each block's forward in place: the module objects (and so ComfyUI's weight keys) stay unchanged.
+            for block in dm.blocks:
+                if "forward" not in block.__dict__:
+                    block.forward = torch.compile(block.forward, fullgraph=False, dynamic=False)
+                    compiled.append(block)
 
         # The exact condition cache keeps keys and values of the reference + previous-frame tokens for every block.
         # Use it only when it fits in free VRAM beside the weights and activations (it would push weights out).
@@ -813,8 +818,8 @@ class SELongCatAvatarSampler:
                 lora.detach()
             if previous_attention is not None:
                 comfy_attention.optimized_attention = previous_attention
-            for i, block in compiled:
-                dm.blocks[i] = block
+            for block in compiled:
+                block.__dict__.pop("forward", None)
         for path in (silent, wav):
             if os.path.exists(path):
                 os.remove(path)

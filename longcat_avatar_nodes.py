@@ -23,6 +23,11 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+try:
+    import comfy_kitchen
+except ImportError:  # older ComfyUI installs: only the int8 attention choice needs it
+    comfy_kitchen = None
+
 import comfy.latent_formats
 import comfy.model_base
 import comfy.model_management as mm
@@ -65,6 +70,9 @@ BUCKETS = {
              4.00: (1920, 480)},
 }
 SIZE_MODES = ["480p bucket (official)", "720p bucket (official)", "custom width x height"]
+ATTENTION_MODES = ["auto", "sage", "pytorch", "int8 (comfy kitchen)"]
+# Positions on the official 8-step distilled grid that each step count samples.
+DISTILLED_GRIDS = {"8": [0, 1, 2, 3, 4, 5, 6, 7], "4": [0, 2, 4, 6], "3": [0, 3, 6]}
 
 
 # ----------------------------------------------------------------------------- model loading
@@ -85,6 +93,8 @@ class LongCatAvatarModel(comfy.model_base.BaseModel):
     def __init__(self, model_config, device=None):
         super().__init__(model_config, comfy.model_base.ModelType.FLOW, device=device,
                          unet_model=LongCatVideoAvatarTransformer)
+        # Premerged DMD checkpoints carry opsd_phase.* tensors: XOR with them turns the merged weights into OPSD ones.
+        self.opsd_phase = {}
 
 
 ARCH_KEYS = ("in_channels", "out_channels", "hidden_size", "depth", "num_heads", "caption_channels", "mlp_ratio",
@@ -101,6 +111,7 @@ DEFAULT_ARCH = {"in_channels": 16, "out_channels": 16, "hidden_size": 4096, "dep
 def load_longcat_model(path, weight_dtype="default", disable_dynamic=False):
     sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
     metadata = metadata or {}
+    opsd_phase = {k[len("opsd_phase."):]: sd.pop(k) for k in [k for k in sd if k.startswith("opsd_phase.")]}
     sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
     for prefix in ("model.diffusion_model.", "diffusion_model."):
         if any(k.startswith(prefix) for k in sd):
@@ -134,6 +145,7 @@ def load_longcat_model(path, weight_dtype="default", disable_dynamic=False):
     manual_cast = mm.unet_manual_cast(None if quant else unet_dtype, load_device, supported)
     model_config.set_inference_dtype(unet_dtype, manual_cast, device=load_device)
     model = model_config.get_model(sd, "")
+    model.opsd_phase = opsd_phase
     patcher_class = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
     patcher = patcher_class(model, load_device=load_device, offload_device=offload_device,
                             fast_disk=comfy.storage.state_dict_fast_disk(sd))
@@ -148,7 +160,8 @@ class SELongCatAvatarLoader:
     def INPUT_TYPES(cls):
         return {"required": {
             "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"default": DEFAULT_MODEL,
-                          "tooltip": "LongCat-Video-Avatar 1.6 transformer. INT8 ConvRot (default) is about twice as fast as BF16 and needs about half the memory."}),
+                          "tooltip": "LongCat-Video-Avatar 1.6 transformer. INT8 ConvRot (default) is about twice as fast as BF16 and needs about half the memory. "
+                                     "Premerged DMD OPSD INT8 ConvRot has both distillation LoRAs merged in (fastest, distilled mode only)."}),
             "weight_dtype": (["default", "bf16", "fp16"], {"default": "default",
                              "tooltip": "Compute type for the BF16 file. Quantized files (INT8 ConvRot) always use their stored format."}),
         }}
@@ -361,6 +374,55 @@ class StepLoRA:
         return total
 
 
+class OPSDPhase:
+    """Switches the premerged checkpoint's LoRA-targeted weights between their DMD and OPSD merges in place.
+
+    Each switched field (INT8 data, its row scales, or a BF16 weight) is XORed with the opsd_phase tensor stored in
+    the file (dense, or sparse with byte indices); a second XOR restores DMD bit-exactly. Works wherever ComfyUI
+    keeps the weight (VRAM or offloaded to RAM): the phase tensors are copied to that device per switch.
+    """
+
+    def __init__(self, diffusion_model, phase):
+        self.fields = []
+        for key, xor in phase.items():
+            if key.endswith(".xor"):
+                name, field = key[:-len(".xor")].rsplit(".", 1)
+                self.fields.append((diffusion_model.get_submodule(name), field, xor, phase.get(key[:-len(".xor")] + ".index")))
+        self.opsd = False
+
+    @staticmethod
+    def _flip(module, field, xor, index):
+        weight = module.weight
+        value = weight._params.scale if field == "weight_scale" else getattr(weight, "_qdata", weight)
+        data = value.detach().view(torch.uint8).view(-1)
+        xor = xor.to(data.device, non_blocking=True)
+        if index is None:
+            data.bitwise_xor_(xor)
+        else:
+            data[index.to(data.device, non_blocking=True).long()] ^= xor
+
+    def switch(self):
+        done = []
+        try:
+            for field in self.fields:
+                self._flip(*field)
+                done.append(field)
+        except BaseException:
+            for field in reversed(done):  # never leave the loaded model half switched
+                self._flip(*field)
+            raise
+        self.opsd = not self.opsd
+
+
+def kitchen_long_attention(fallback):
+    """comfy-kitchen INT8 attention for the long full-context self-attention, the active backend for the rest."""
+    def attention(q, k, v, heads, *args, **kwargs):
+        if q.shape[-1] == 128 and min(q.shape[-2], k.shape[-2]) >= 30000:
+            return comfy_kitchen.int8_attention(q, k, v)
+        return fallback(q, k, v, heads, *args, **kwargs)
+    return attention
+
+
 def context_and_mask(conditioning, device, dtype, length=512):
     context = conditioning[0][0].to(device=device, dtype=torch.float32)
     if context.shape[1] < length:
@@ -491,7 +553,7 @@ class SELongCatAvatarSampler:
             "opsd_lora": (loras, {"default": DEFAULT_OPSD, "tooltip": "Official OPSD LoRA (loraB). Runs the remaining steps."}),
             "distilled_8_steps": ("BOOLEAN", {"default": True, "label_on": "ENABLED (official 1.6, 8 steps)", "label_off": "DISABLED (50-step base model with guidance)",
                                               "tooltip": "Official LongCat-Avatar 1.6 recipe: 8 distilled steps with the DMD + OPSD LoRAs, guidance 1. Off runs the base model with Steps and guidance (about 20x slower)."}),
-            "mix_steps": ("INT", {"default": 4, "min": 0, "max": 8, "tooltip": "Official 4: steps 1-4 use the DMD LoRA (x Mix Alpha), steps 5-8 the OPSD LoRA."}),
+            "mix_steps": ("INT", {"default": 4, "min": 0, "max": 8, "tooltip": "Official 4: steps 1-4 of the 8-step grid use the DMD LoRA (x Mix Alpha), steps 5-8 the OPSD LoRA (with 3 or 4 Distilled Steps the grid positions below 4 use DMD)."}),
             "mix_alpha": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "DMD weight during the mixed steps (official 1.0). More DMD = steadier structure."}),
             "steps": ("INT", {"default": 50, "min": 4, "max": 100, "tooltip": "Only with the 8-step mode off."}),
             "text_guidance": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 10.0, "step": 0.1, "tooltip": "Only with the 8-step mode off (official 4)."}),
@@ -502,9 +564,9 @@ class SELongCatAvatarSampler:
                                              "tooltip": "Official Kim_Vocal_2 vocal separation before the Whisper features (music and noise do not move the mouth). The saved video keeps the original audio."}),
             "condition_cache": ("BOOLEAN", {"default": True, "label_on": "ENABLED (exact, faster)", "label_off": "DISABLED (normal)",
                                             "tooltip": "Computes the reference and previous-frame tokens once per LoRA phase instead of every step. Same result, faster long videos. Switches itself off when it does not fit in free VRAM (large sizes)."}),
-            "attention": (["auto", "sage", "pytorch"], {"default": "auto", "tooltip": "auto uses ComfyUI's attention (SageAttention with our launchers). sage forces SageAttention if installed."}),
+            "attention": (ATTENTION_MODES, {"default": "auto", "tooltip": "auto uses ComfyUI's attention (SageAttention with our launchers). sage forces SageAttention if installed. int8 (comfy kitchen) runs the long full-context self-attention with comfy-kitchen's INT8 kernel (fastest measured on RTX A6000)."}),
             "torch_compile": ("BOOLEAN", {"default": False, "label_on": "ENABLED", "label_off": "DISABLED (normal)",
-                                          "tooltip": "Compiles each transformer block (first run slower, later runs faster). Needs Triton."}),
+                                          "tooltip": "Compiles each transformer block (first run slower, later runs faster while ComfyUI stays open). Needs Triton."}),
             "frames_per_segment": ("INT", {"default": 93, "min": 33, "max": 189, "step": 4, "tooltip": "Official 93 frames (3.72 s) per segment."}),
             "context_frames": ("INT", {"default": 13, "min": 5, "max": 45, "step": 4, "tooltip": "Official 13 frames carried into the next segment."}),
             "ref_img_index": ("INT", {"default": 10, "min": -64, "max": 64, "tooltip": "Official 10: time position of the identity reference in later segments."}),
@@ -523,6 +585,8 @@ class SELongCatAvatarSampler:
             "mouth_detector": ("STRING", {"default": "models/buffalo_l/det_10g.onnx"}),
             "live_preview": (["auto", "latent", "off"], {"default": "latent"}),
             "save_original_too": ("BOOLEAN", {"default": False, "tooltip": "With mouth enhancement on, also save the video without it (for comparisons)."}),
+            "distilled_steps": (list(DISTILLED_GRIDS), {"default": "8", "tooltip": "8 = official. 4 and 3 sample grid positions 0,2,4,6 and 0,3,6 of the same 8-step schedule: 2x and 2.7x fewer transformer passes, close to the 8-step look."}),
+            "shorten_last_segment": ("BOOLEAN", {"default": False, "tooltip": "Samples the last segment only as long as the remaining audio needs (earlier segments are unchanged). Faster; the last frames can differ slightly."}),
         }, "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"}}
 
     RETURN_TYPES = ("VIDEO", "STRING")
@@ -539,19 +603,26 @@ class SELongCatAvatarSampler:
                mask_frame_range=0, crf=17, encoding_preset="fast", filename_prefix="video/LongCat_Avatar/LongCat",
                image=None, negative=None, mouth_enhancement=False, mouth_fidelity=.9, mouth_blend=.7,
                mouth_model="codeformer.pth", mouth_detector="models/buffalo_l/det_10g.onnx", live_preview="latent",
-               save_original_too=False, unique_id=None, prompt=None):
+               save_original_too=False, distilled_steps="8", shorten_last_segment=False, unique_id=None, prompt=None):
         started = time.perf_counter()
-        if size_mode not in SIZE_MODES or attention not in ("auto", "sage", "pytorch"):
-            raise ValueError("LongCat Avatar: invalid size mode or attention choice (the workflow widgets may be shifted).")
+        if size_mode not in SIZE_MODES or attention not in ATTENTION_MODES or distilled_steps not in DISTILLED_GRIDS:
+            raise ValueError("LongCat Avatar: invalid size mode, attention or distilled steps choice (the workflow widgets may be shifted).")
         if (frames_per_segment - 1) % 4 or (context_frames - 1) % 4 or context_frames >= frames_per_segment:
             raise ValueError("Frames per segment and context frames must be 4n+1, with fewer context frames than segment frames.")
+        if attention.startswith("int8") and (comfy_kitchen is None or not comfy_kitchen.int8_attention_is_available()):
+            raise ValueError("comfy-kitchen INT8 attention is not available on this GPU: choose auto or sage attention.")
+        premerged = bool(model.model.opsd_phase)
+        if premerged and (not distilled_8_steps or mix_alpha != 1.0):
+            raise ValueError("The premerged DMD OPSD checkpoint runs only the distilled mode with Mix Alpha 1.0. "
+                             "Use the normal INT8 ConvRot or BF16 checkpoint for the base model or other mixes.")
         mouth = None
         if mouth_enhancement and mouth_blend != 0:
             from .codeformer_mouth import model_path
             model_path("facerestore_models", mouth_model)
             model_path("insightface", mouth_detector)
-        dmd_path = folder_paths.get_full_path_or_raise("loras", dmd_lora) if distilled_8_steps else None
-        opsd_path = folder_paths.get_full_path_or_raise("loras", opsd_lora) if distilled_8_steps else None
+        runtime_lora = distilled_8_steps and not premerged
+        dmd_path = folder_paths.get_full_path_or_raise("loras", dmd_lora) if runtime_lora else None
+        opsd_path = folder_paths.get_full_path_or_raise("loras", opsd_lora) if runtime_lora else None
         use_cfg = (not distilled_8_steps) and (text_guidance > 1.0 or audio_guidance > 1.0)
         if use_cfg and negative is None:
             raise ValueError("Connect a negative conditioning (the official negative prompt) when guidance is above 1.")
@@ -609,9 +680,10 @@ class SELongCatAvatarSampler:
         dm_dtype = work.model.diffusion_model.compute_dtype() if hasattr(work.model.diffusion_model, "compute_dtype") else torch.bfloat16
         lora = None
         lora_bytes = 0
-        if distilled_8_steps:
+        if runtime_lora:
             lora = StepLoRA(work.model.diffusion_model, [dmd_path, opsd_path], device, dm_dtype)
             lora_bytes = lora.nbytes()
+        opsd_phase = OPSDPhase(work.model.diffusion_model, work.model.opsd_phase) if premerged else None
         tokens = (frames_latent + 1) * (latent_h // 2) * (latent_w // 2)
         activation = int(tokens * 4096 * 2 * 9 + 3 * 1024 ** 3)
         mm.load_models_gpu([work], memory_required=activation + lora_bytes)
@@ -627,8 +699,14 @@ class SELongCatAvatarSampler:
         elif attention == "pytorch":
             previous_attention = comfy_attention.optimized_attention
             comfy_attention.optimized_attention = comfy_attention.attention_pytorch
+        elif attention.startswith("int8"):
+            previous_attention = comfy_attention.optimized_attention
+            comfy_attention.optimized_attention = kitchen_long_attention(previous_attention)
         compiled = []
         if torch_compile:
+            # Blocks of both weight formats (INT8 and BF16 edge blocks), the shorter last segment and the phase
+            # changes need more graph variants than Dynamo's default limit of 8.
+            torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 32)
             # Compile each block's forward in place: the module objects (and so ComfyUI's weight keys) stay unchanged.
             for block in dm.blocks:
                 if "forward" not in block.__dict__:
@@ -653,8 +731,10 @@ class SELongCatAvatarSampler:
             neg_y, neg_mask = context_and_mask(negative, device, dtype)
             neg_y = dm.text_embed(neg_y, neg_mask)
 
+        grid = DISTILLED_GRIDS[distilled_steps]
         if distilled_8_steps:
             timesteps, sigmas = official_sigmas(True)
+            timesteps, sigmas = timesteps[grid], torch.cat([sigmas[grid], sigmas[-1:]])
         else:
             timesteps, sigmas = official_sigmas(False, steps)
         timesteps, sigmas = timesteps.to(device), sigmas.to(device)
@@ -682,14 +762,15 @@ class SELongCatAvatarSampler:
         report = {"checkpoint": model.model_options.get("longcat_checkpoint"), "width": W, "height": H, "seed": seed,
                   "fps": FPS, "audio_seconds": round(seconds, 3), "segments": segments, "frames_per_segment": frames_per_segment,
                   "context_frames": context_frames, "generated_frames": gen_frames, "saved_frames": out_frames,
-                  "recipe": "official 1.6 distilled 8 steps (DMD/OPSD)" if distilled_8_steps else f"base {n_steps} steps, guidance text {text_guidance} audio {audio_guidance}",
+                  "recipe": (("official 1.6 distilled 8 steps (DMD/OPSD)" if n_steps == 8 else f"1.6 distilled {n_steps} of 8 steps (DMD/OPSD)")
+                             if distilled_8_steps else f"base {n_steps} steps, guidance text {text_guidance} audio {audio_guidance}"),
                   "mix_steps": mix_steps, "mix_alpha": mix_alpha, "timesteps": [round(float(t), 3) for t in timesteps],
                   "ref_img_index": ref_img_index, "mask_frame_range": mask_frame_range, "condition_cache": condition_cache,
                   "condition_cache_gb": round(cache_bytes / 1024 ** 3, 2),
                   "attention": attention, "torch_compile": torch_compile, "vocal_separation": separation,
                   "image": image is not None, "loras": lora.files if lora is not None else []}
         print(f"{LOG} {seconds:.2f}s audio -> {out_frames} frames, {segments} segment(s) of {frames_per_segment}, {W}x{H}, "
-              f"{'8-step DMD/OPSD' if distilled_8_steps else str(n_steps) + ' steps'}, cache={condition_cache}", flush=True)
+              f"{str(n_steps) + '-step DMD/OPSD' if distilled_8_steps else str(n_steps) + ' steps'}, cache={condition_cache}", flush=True)
         dit_seconds = 0.0
         decode_seconds = 0.0
         segment_times = []
@@ -706,7 +787,13 @@ class SELongCatAvatarSampler:
             for seg in range(segments):
                 mm.throw_exception_if_processing_interrupted()
                 seg_started = time.perf_counter()
-                audio_win = window_audio(full_audio, seg * step_frames, frames_per_segment).to(device)
+                window = frames_per_segment
+                if shorten_last_segment and seg == segments - 1:
+                    remaining = out_frames - written + (context_frames if seg else 0)
+                    window = min(frames_per_segment, max(33, 1 + 4 * math.ceil((remaining - 1) / 4)))
+                    report["last_segment_frames"] = window
+                frames_latent = (window - 1) // 4 + 1
+                audio_win = window_audio(full_audio, seg * step_frames, window).to(device)
                 noise = torch.randn((1, 16, frames_latent, latent_h, latent_w), generator=generator, dtype=torch.float32).to(device)
                 latents = noise
                 num_cond, num_ref = 0, 0
@@ -737,8 +824,12 @@ class SELongCatAvatarSampler:
                 t_seg = time.perf_counter()
                 for i in range(n_steps):
                     mm.throw_exception_if_processing_interrupted()
+                    if opsd_phase is not None and grid[i] >= mix_steps and not opsd_phase.opsd:
+                        opsd_phase.switch()
+                        if cond_cache is not None:
+                            cond_cache = {}
                     if lora is not None:
-                        mixed = i < mix_steps
+                        mixed = grid[i] < mix_steps
                         new_phase = "mix" if mixed else "opsd"
                         if new_phase != phase:
                             lora.multipliers = [mix_alpha if mixed else 0.0, (1.0 - mix_alpha) if mixed else 1.0]
@@ -776,6 +867,8 @@ class SELongCatAvatarSampler:
                     else:
                         progress.update_absolute(done, preview=preview_image)
                 dit_seconds += time.perf_counter() - t_seg
+                if opsd_phase is not None and opsd_phase.opsd:
+                    opsd_phase.switch()  # back to DMD before the VAE can move weights between devices
                 del text_cache, neg_cache, cond_cache, cond_cache_neg
                 if num_ref:
                     latents = latents[:, :, num_ref:]
@@ -816,6 +909,8 @@ class SELongCatAvatarSampler:
         finally:
             if lora is not None:
                 lora.detach()
+            if opsd_phase is not None and opsd_phase.opsd:
+                opsd_phase.switch()
             if previous_attention is not None:
                 comfy_attention.optimized_attention = previous_attention
             for block in compiled:

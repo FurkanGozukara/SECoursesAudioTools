@@ -36,7 +36,13 @@ Audio + an optional photo + an optional scene prompt to a lip-synced talking or 
 - Condition cache (default on): the reference and previous-frame tokens do not depend on the noisy frames, so their keys and
   values are computed once per LoRA phase and reused (exact). It switches itself off when it does not fit in free VRAM.
 - Frame-chunked residual updates bound the temporary memory at large sizes (1280 x 1920 works on a 32 GB card).
-- Torch compile is optional. Attention uses ComfyUI's backend (SageAttention with our launchers).
+- Torch compile is optional. Attention uses ComfyUI's backend (SageAttention with our launchers); `int8 (comfy kitchen)`
+  runs the long full-context self-attention with comfy-kitchen's INT8 kernel.
+- Premerged model (`LongCat_Video_Avatar_1.6_Premerged_DMD_OPSD_INT8_ConvRot.safetensors`): the DMD LoRA merged into the
+  INT8 ConvRot weights, plus `opsd_phase.*` tensors that XOR the LoRA-targeted fields into the OPSD merge and back
+  (bit-exact, built from both merged checkpoints). No runtime LoRA work; distilled mode with Mix Alpha 1 only.
+- Distilled steps 8 / 4 / 3 sample positions `0-7`, `0,2,4,6` or `0,3,6` of the official 8-step grid (DMD below Mix
+  Steps). Shorten last segment samples the final segment only as long as the remaining audio needs.
 
 ## Tests
 

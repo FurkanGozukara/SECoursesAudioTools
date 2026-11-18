@@ -109,7 +109,18 @@ DEFAULT_ARCH = {"in_channels": 16, "out_channels": 16, "hidden_size": 4096, "dep
 
 
 def load_longcat_model(path, weight_dtype="default", disable_dynamic=False):
-    sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
+    premerged = False
+    if path.lower().endswith((".safetensors", ".sft")):
+        with safe_open(path, framework="pt") as f:
+            premerged = any(k.startswith("opsd_phase.") for k in f.keys())
+    if premerged:
+        # The premerged weights are switched in place: load them as private writable tensors with a regular patcher,
+        # never dynamic VRAM's read-only file mapping (writing there is an access violation).
+        with safe_open(path, framework="pt") as f:
+            sd, metadata = {k: f.get_tensor(k) for k in f.keys()}, f.metadata()
+        disable_dynamic = True
+    else:
+        sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
     metadata = metadata or {}
     opsd_phase = {k[len("opsd_phase."):]: sd.pop(k) for k in [k for k in sd if k.startswith("opsd_phase.")]}
     sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)

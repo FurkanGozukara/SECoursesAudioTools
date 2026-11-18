@@ -12,6 +12,7 @@ run_demo_avatar_single_audio_to_video.py with --model_type avatar-v1.6 --use_dis
 * 480p (or 720p) aspect buckets; 25 fps output with the original soundtrack.
 """
 
+import functools
 import json
 import logging
 import math
@@ -109,18 +110,7 @@ DEFAULT_ARCH = {"in_channels": 16, "out_channels": 16, "hidden_size": 4096, "dep
 
 
 def load_longcat_model(path, weight_dtype="default", disable_dynamic=False):
-    premerged = False
-    if path.lower().endswith((".safetensors", ".sft")):
-        with safe_open(path, framework="pt") as f:
-            premerged = any(k.startswith("opsd_phase.") for k in f.keys())
-    if premerged:
-        # The premerged weights are switched in place: load them as private writable tensors with a regular patcher,
-        # never dynamic VRAM's read-only file mapping (writing there is an access violation).
-        with safe_open(path, framework="pt") as f:
-            sd, metadata = {k: f.get_tensor(k) for k in f.keys()}, f.metadata()
-        disable_dynamic = True
-    else:
-        sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
+    sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
     metadata = metadata or {}
     opsd_phase = {k[len("opsd_phase."):]: sd.pop(k) for k in [k for k in sd if k.startswith("opsd_phase.")]}
     sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
@@ -385,43 +375,64 @@ class StepLoRA:
         return total
 
 
-class OPSDPhase:
-    """Switches the premerged checkpoint's LoRA-targeted weights between their DMD and OPSD merges in place.
+def _field(weight, field):
+    return weight._params.scale if field == "weight_scale" else getattr(weight, "_qdata", weight)
 
-    Each switched field (INT8 data, its row scales, or a BF16 weight) is XORed with the opsd_phase tensor stored in
-    the file (dense, or sparse with byte indices); a second XOR restores DMD bit-exactly. Works wherever ComfyUI
-    keeps the weight (VRAM or offloaded to RAM): the phase tensors are copied to that device per switch.
-    """
 
-    def __init__(self, diffusion_model, phase):
-        self.fields = []
-        for key, xor in phase.items():
-            if key.endswith(".xor"):
-                name, field = key[:-len(".xor")].rsplit(".", 1)
-                self.fields.append((diffusion_model.get_submodule(name), field, xor, phase.get(key[:-len(".xor")] + ".index")))
-        self.opsd = False
+def _field_bytes(weight, field):
+    return _field(weight, field).detach().view(torch.uint8).view(-1)
 
-    @staticmethod
-    def _flip(module, field, xor, index):
-        weight = module.weight
-        value = weight._params.scale if field == "weight_scale" else getattr(weight, "_qdata", weight)
-        data = value.detach().view(torch.uint8).view(-1)
+
+@torch.compiler.disable
+def _flip_opsd(weight, fields):
+    for field, xor, index, size in fields:
+        data = _field_bytes(weight, field)
+        if data.numel() != size:
+            raise ValueError("LongCat premerged model: unexpected weight layout for the OPSD switch.")
         xor = xor.to(data.device, non_blocking=True)
         if index is None:
             data.bitwise_xor_(xor)
         else:
             data[index.to(data.device, non_blocking=True).long()] ^= xor
 
+
+def _opsd_forward(module, fields, input, weight, bias):
+    # The weight ComfyUI cast for this call (a VRAM copy or the resident tensor) becomes the OPSD merge for the matmul,
+    # then DMD again: the stored model, a read-only file mapping with dynamic VRAM, is never written.
+    _flip_opsd(weight, fields)
+    try:
+        return type(module)._forward(module, input, weight, bias)
+    finally:
+        _flip_opsd(weight, fields)
+
+
+class OPSDPhase:
+    """Runs the premerged checkpoint's LoRA-targeted layers with their OPSD merge instead of the stored DMD merge.
+
+    Each switched field (INT8 data, its row scales, or a BF16 weight) differs from DMD by the XOR stored in the file
+    as an opsd_phase tensor (dense, or sparse with byte indices). While OPSD is on, those layers flip the weight of each
+    call (ComfyUI's quantized Linear._forward) and flip it back afterwards, so it works with dynamic VRAM, offloading
+    and torch.compile alike.
+    """
+
+    def __init__(self, diffusion_model, phase):
+        fields = {}
+        for key, xor in phase.items():
+            if key.endswith(".xor"):
+                name, field = key[:-len(".xor")].rsplit(".", 1)
+                module = diffusion_model.get_submodule(name)
+                stored = _field(module.weight, field)
+                fields.setdefault(module, []).append((field, xor, phase.get(key[:-len(".xor")] + ".index"),
+                                                      stored.numel() * stored.element_size()))
+        self.fields = fields
+        self.opsd = False
+
     def switch(self):
-        done = []
-        try:
-            for field in self.fields:
-                self._flip(*field)
-                done.append(field)
-        except BaseException:
-            for field in reversed(done):  # never leave the loaded model half switched
-                self._flip(*field)
-            raise
+        for module, fields in self.fields.items():
+            if self.opsd:
+                del module._forward
+            else:
+                module._forward = functools.partial(_opsd_forward, module, fields)
         self.opsd = not self.opsd
 
 
@@ -879,7 +890,7 @@ class SELongCatAvatarSampler:
                         progress.update_absolute(done, preview=preview_image)
                 dit_seconds += time.perf_counter() - t_seg
                 if opsd_phase is not None and opsd_phase.opsd:
-                    opsd_phase.switch()  # back to DMD before the VAE can move weights between devices
+                    opsd_phase.switch()  # back to DMD for the next segment
                 del text_cache, neg_cache, cond_cache, cond_cache_neg
                 if num_ref:
                     latents = latents[:, :, num_ref:]

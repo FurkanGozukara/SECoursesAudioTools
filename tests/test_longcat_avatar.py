@@ -99,18 +99,30 @@ class LongCatRecipeTests(unittest.TestCase):
 
     def test_opsd_phase_switch_is_exact_and_reversible(self):
         nodes = importlib.import_module(f"{PACKAGE}.longcat_avatar_nodes")
-        model = torch.nn.Sequential(torch.nn.Linear(16, 16).to(torch.bfloat16))
+
+        class Linear(torch.nn.Linear):  # the _forward(input, weight, bias) hook of ComfyUI's quantized Linear
+            def _forward(self, input, weight, bias):
+                return torch.nn.functional.linear(input, weight, bias)
+
+            def forward(self, input):
+                return self._forward(input, self.weight, self.bias)
+
+        model = torch.nn.Sequential(Linear(16, 16).to(torch.bfloat16))
         dmd = model[0].weight.detach().clone()
         opsd = dmd.clone()
         opsd[0, :3] += 1
         xor = dmd.view(torch.uint8).flatten() ^ opsd.view(torch.uint8).flatten()
         index = xor.nonzero().flatten().int()
-        for phase in ({"0.weight.xor": xor}, {"0.weight.xor": xor[index.long()], "0.weight.index": index}):
-            switch = nodes.OPSDPhase(model, phase)
-            switch.switch()
-            self.assertTrue(torch.equal(model[0].weight, opsd) and switch.opsd)
-            switch.switch()
-            self.assertTrue(torch.equal(model[0].weight, dmd) and not switch.opsd)
+        x = torch.randn(2, 16, dtype=torch.bfloat16)
+        with torch.no_grad():
+            for phase in ({"0.weight.xor": xor}, {"0.weight.xor": xor[index.long()], "0.weight.index": index}):
+                switch = nodes.OPSDPhase(model, phase)
+                switch.switch()
+                self.assertTrue(torch.equal(model(x), torch.nn.functional.linear(x, opsd, model[0].bias)))
+                self.assertTrue(torch.equal(model[0].weight, dmd))  # the stored weight is never left changed
+                switch.switch()
+                self.assertTrue(torch.equal(model(x), torch.nn.functional.linear(x, dmd, model[0].bias)))
+                self.assertFalse(switch.opsd or "_forward" in model[0].__dict__)
 
 
 if __name__ == "__main__":

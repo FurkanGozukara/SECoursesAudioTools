@@ -742,11 +742,15 @@ class SELongCatAvatarSampler:
         cache_used = False
         if condition_cache and segments > 1:
             free = mm.get_free_memory(device)
-            # activation already budgets 9 hidden-state copies + 3 GiB; the cache only has to fit beside it
-            cache_used = cache_bytes < free - activation
-            if not cache_used:
-                print(f"{LOG} condition cache off for this size: needs {cache_bytes / 1024 ** 3:.1f} GB, "
-                      f"{free / 1024 ** 3:.1f} GB free", flush=True)
+            # With dynamic VRAM most weights are paged in during the first step, so free memory here can include room
+            # they will need: count the weights not yet on the GPU. activation budgets 9 hidden-state copies + 3 GiB.
+            # A cache that only fits by paging weights out is slower than no cache (720p on 32 GB: 74 s against 60 s
+            # per segment).
+            missing = max(0, work.model_size() - work.loaded_size())
+            cache_used = cache_bytes < free - activation - missing
+            print(f"{LOG} condition cache {'on' if cache_used else 'off for this size'}: needs {cache_bytes / 1024 ** 3:.1f} GB, "
+                  f"{max(0, free - activation - missing) / 1024 ** 3:.1f} GB left beside the weights and activations",
+                  flush=True)
         condition_cache = cache_used
         text_y, text_mask = context_and_mask(positive, device, dtype)
         text_y = dm.text_embed(text_y, text_mask)

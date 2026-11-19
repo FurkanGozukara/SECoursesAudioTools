@@ -79,11 +79,23 @@ class LongCatPortTests(unittest.TestCase):
                 lcm.ROW_CHUNK = saved
             self.assertEqual((plain - chunked).abs().max().item(), 0.0)
 
-    def test_rope_matches_rotate_half(self):
+    def test_fused_norm_rope_matches_official(self):
         cos, sin, mats = lcm.rope_3d_cos_sin(128, (3, 4, 5), torch.device("cpu"), 10, 1)
-        x = torch.randn(1, 2, 60, 128)
-        reference = x * cos + lcm._rotate_half(x) * sin
-        self.assertLess((lcm.apply_rope(x, cos, sin, mats) - reference).abs().max().item(), 1e-5)
+        attn = lcm.SelfAttention(256, 2, dtype=torch.float32, operations=comfy.ops.manual_cast)
+        with torch.no_grad():
+            for p in attn.parameters():
+                p.copy_(torch.randn_like(p) * 0.05 + (1.0 if p.dim() == 1 and p.shape[0] == 128 else 0.0))
+            x = torch.randn(1, 60, 256)
+            q, k, v = attn.qkv_rows(x, mats)
+            ref_q, ref_k, ref_v = attn.qkv(x).view(1, 60, 3, 2, 128).unbind(2)
+
+            def official(t, norm):  # RMSNorm_FP32, then q * cos + rotate_half(q) * sin per head
+                t = torch.nn.functional.rms_norm(t, (128,), eps=1e-6) * norm.weight
+                return t * cos[None, :, None] + lcm._rotate_half(t) * sin[None, :, None]
+
+            self.assertLess((q - official(ref_q, attn.q_norm)).abs().max().item(), 1e-5)
+            self.assertLess((k - official(ref_k, attn.k_norm)).abs().max().item(), 1e-5)
+            self.assertTrue(torch.equal(v, ref_v))
 
 
 class LongCatRecipeTests(unittest.TestCase):

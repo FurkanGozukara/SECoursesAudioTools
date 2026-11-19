@@ -30,6 +30,7 @@ except ImportError:  # older ComfyUI installs: only the int8 attention choice ne
     comfy_kitchen = None
 
 import comfy.latent_formats
+import comfy.ldm.modules.attention as comfy_attention
 import comfy.model_base
 import comfy.model_management as mm
 import comfy.model_patcher
@@ -439,8 +440,9 @@ class OPSDPhase:
 def kitchen_long_attention(fallback):
     """comfy-kitchen INT8 attention for the long full-context self-attention, the active backend for the rest."""
     def attention(q, k, v, heads, *args, **kwargs):
-        if q.shape[-1] == 128 and min(q.shape[-2], k.shape[-2]) >= 30000:
-            return comfy_kitchen.int8_attention(q, k, v)
+        # token-major [B, N, heads * 128] calls from the LongCat blocks
+        if not kwargs.get("skip_reshape") and q.shape[-1] == heads * 128 and min(q.shape[1], k.shape[1]) >= 30000:
+            return comfy_attention.attention_comfy_kitchen_int8(q, k, v, heads)
         return fallback(q, k, v, heads, *args, **kwargs)
     return attention
 
@@ -713,7 +715,6 @@ class SELongCatAvatarSampler:
         dtype = dm.compute_dtype()
         latent_format = work.model.latent_format
         previous_attention = None
-        import comfy.ldm.modules.attention as comfy_attention
         if attention == "sage":
             if getattr(comfy_attention, "SAGE_ATTENTION_IS_AVAILABLE", False) or hasattr(comfy_attention, "attention_sage"):
                 previous_attention = comfy_attention.optimized_attention
@@ -741,7 +742,8 @@ class SELongCatAvatarSampler:
         cache_used = False
         if condition_cache and segments > 1:
             free = mm.get_free_memory(device)
-            cache_used = cache_bytes < 0.6 * max(0, free - activation)
+            # activation already budgets 9 hidden-state copies + 3 GiB; the cache only has to fit beside it
+            cache_used = cache_bytes < free - activation
             if not cache_used:
                 print(f"{LOG} condition cache off for this size: needs {cache_bytes / 1024 ** 3:.1f} GB, "
                       f"{free / 1024 ** 3:.1f} GB free", flush=True)

@@ -25,17 +25,17 @@ import torch.nn.functional as F
 
 import comfy.ldm.modules.attention as comfy_attention
 import comfy.ops
+import comfy.quant_ops
 
 # Token rows processed at once by the row-wise parts of a block (65536 rows x 4096 channels x 4 bytes = 1 GiB of
-# FP32 temporaries per chunk). Whole segments up to 720p run unchunked; 1920p runs in about six frame chunks.
+# FP32 temporaries per chunk). The attention input (modulation, qkv, q/k norm + RoPE) runs whole up to twice that
+# (720p segments); 1920p runs in frame chunks.
 ROW_CHUNK = 65536
 
 
-def _attention(q, k, v):
-    """q, k, v: [B, H, N, D] -> [B, H, N, D] with ComfyUI's active attention backend."""
-    heads = q.shape[1]
-    out = comfy_attention.optimized_attention(q, k, v, heads, skip_reshape=True, skip_output_reshape=True)
-    return out
+def _attention(q, k, v, heads):
+    """q, k, v: [B, N, heads * D] (token-major, no transposes) -> [B, N, heads * D] with ComfyUI's attention backend."""
+    return comfy_attention.optimized_attention(q, k, v, heads)
 
 
 def _linear_as(module, x, dtype):
@@ -57,10 +57,9 @@ class RMSNormFP32(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
 
     def forward(self, x):
-        # official: (x.float() normalized).type_as(x) * weight; the fused kernel accumulates in fp32 and rounds once
-        out = F.rms_norm(x, (x.shape[-1],), eps=self.eps)
-        weight = comfy.ops.cast_to_input(self.weight, out, copy=False)
-        return out * weight
+        # official: (x.float() normalized).type_as(x) * weight; the fused kernel also applies the weight in fp32 and
+        # rounds once
+        return F.rms_norm(x, (x.shape[-1],), comfy.ops.cast_to_input(self.weight, x, copy=False), self.eps)
 
 
 class LayerNormFP32(nn.Module):
@@ -93,10 +92,6 @@ def _mod_ln_eager(x, shift, scale, eps: float = 1e-6):
     return (out * (scale + 1) + shift).to(x.dtype)
 
 
-def _gate_res_eager(x, gate, y):
-    return (x.float() + gate * y.float()).to(x.dtype)
-
-
 class _Fused:
     """One-kernel versions of the fp32 elementwise chains (torch.compile); same math, eager fallback on any failure."""
 
@@ -119,7 +114,6 @@ class _Fused:
 
 
 mod_ln = _Fused(_mod_ln_eager)
-gate_res = _Fused(_gate_res_eager)
 
 
 def _modulate(norm, x, shift, scale):
@@ -182,28 +176,11 @@ def rope_3d_cos_sin(head_dim, grid, device, frame_index=None, num_ref_latents=No
 
 
 def rope_matrices(cos, sin):
-    """[N, D] interleaved cos/sin -> [1, 1, N, D/2, 2, 2] fp32 rotation matrices [[c, -s], [s, c]] (flux layout)."""
+    """[N, D] interleaved cos/sin -> [1, N, 1, D/2, 2, 2] fp32 rotation matrices [[c, -s], [s, c]] for token-major
+    [B, N, H, D] q/k (flux layout). Rotating the pairs (x0 c - x1 s, x0 s + x1 c) is exactly the official
+    q * cos + rotate_half(q) * sin."""
     c, s = cos[:, 0::2], sin[:, 0::2]
-    return torch.stack([c, -s, s, c], dim=-1).reshape(1, 1, c.shape[0], c.shape[1], 2, 2).contiguous()
-
-
-def apply_rope(x, cos, sin, mats=None):
-    """x [B, H, N, D]; official rotate_half RoPE computed in fp32, returned in x.dtype.
-
-    Uses ComfyUI's apply_rope1 (fused comfy_kitchen kernel when available) on the same interleaved pairs:
-    out = (x0 c - x1 s, x0 s + x1 c), exactly the official q * cos + rotate_half(q) * sin.
-    """
-    if mats is None:
-        mats = rope_matrices(cos, sin)
-    try:
-        from comfy.ldm.flux.math import apply_rope1
-        return apply_rope1(x, mats)
-    except Exception:
-        out = torch.empty_like(x)
-        for start, end in _chunks(x.shape[2], 8192):
-            xs = x[:, :, start:end].float()
-            out[:, :, start:end] = (xs * cos[start:end] + _rotate_half(xs) * sin[start:end]).to(x.dtype)
-        return out
+    return torch.stack([c, -s, s, c], dim=-1).reshape(1, c.shape[0], 1, c.shape[1], 2, 2).contiguous()
 
 
 def rope_1d(x, pos):
@@ -230,28 +207,14 @@ class SelfAttention(nn.Module):
         self.k_norm = RMSNormFP32(self.head_dim, eps=1e-6, device=device, dtype=dtype)
         self.proj = operations.Linear(dim, dim, device=device, dtype=dtype)
 
-    def qkv_heads(self, x):
-        """x [B, N, C] -> q, k, v [B, H, N, D] after RMS norms (chunked over tokens)."""
-        B, N, C = x.shape
-        q = torch.empty((B, self.num_heads, N, self.head_dim), dtype=x.dtype, device=x.device)
-        k = torch.empty_like(q)
-        v = torch.empty_like(q)
-        for start, end in _chunks(N):
-            part = self.qkv(x[:, start:end]).view(B, end - start, 3, self.num_heads, self.head_dim)
-            part = part.permute(2, 0, 3, 1, 4)
-            q[:, :, start:end] = self.q_norm(part[0])
-            k[:, :, start:end] = self.k_norm(part[1])
-            v[:, :, start:end] = part[2]
+    def qkv_rows(self, x, pe):
+        """x [B, n, C] modulated rows, pe their RoPE matrices -> q, k (RMS-normed and rotated in one comfy-kitchen
+        kernel) and v, each [B, n, H, D]; v stays a view of the qkv projection."""
+        B, n, _ = x.shape
+        q, k, v = self.qkv(x).view(B, n, 3, self.num_heads, self.head_dim).unbind(2)
+        q, k = comfy.quant_ops.ck.rms_rope(q, k, pe, comfy.ops.cast_to_input(self.q_norm.weight, q),
+                                           comfy.ops.cast_to_input(self.k_norm.weight, k), self.q_norm.eps)
         return q, k, v
-
-    def out_proj(self, x):
-        """x [B, H, N, D] -> [B, N, C]."""
-        B, H, N, D = x.shape
-        x = x.transpose(1, 2).reshape(B, N, H * D)
-        out = torch.empty((B, N, self.dim), dtype=x.dtype, device=x.device)
-        for start, end in _chunks(N):
-            out[:, start:end] = self.proj(x[:, start:end])
-        return out
 
 
 class TextCrossAttention(nn.Module):
@@ -267,24 +230,16 @@ class TextCrossAttention(nn.Module):
         self.k_norm = RMSNormFP32(self.head_dim, eps=1e-6, device=device, dtype=dtype)
 
     def text_kv(self, cond):
-        """cond [B, L, C] -> k, v [B, H, L, D]; constant across steps and blocks' calls."""
+        """cond [B, L, C] -> k, v [B, L, C]; constant across steps and blocks' calls."""
         B, L, _ = cond.shape
-        kv = self.kv_linear(cond).view(B, L, 2, self.num_heads, self.head_dim)
-        k, v = kv.unbind(2)
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-        return k, v
+        k, v = self.kv_linear(cond).view(B, L, 2, self.num_heads, self.head_dim).unbind(2)
+        return self.k_norm(k).flatten(2), v.flatten(2)
 
     def forward(self, x, text_k, text_v):
-        """x [B, N, C] (noisy tokens), every batch item attends to its own L text tokens."""
+        """x [B, N, C] (noisy tokens, at most one row chunk), every batch item attends to its own L text tokens."""
         B, N, C = x.shape
-        out = torch.empty_like(x)
-        for start, end in _chunks(N):
-            q = self.q_linear(x[:, start:end]).view(B, end - start, self.num_heads, self.head_dim)
-            q = self.q_norm(q).transpose(1, 2)
-            o = _attention(q, text_k, text_v).transpose(1, 2).reshape(B, end - start, C)
-            out[:, start:end] = self.proj(o)
-        return out
+        q = self.q_norm(self.q_linear(x).view(B, N, self.num_heads, self.head_dim)).flatten(2)
+        return self.proj(_attention(q, text_k, text_v, self.num_heads))
 
 
 class AudioCrossAttention(nn.Module):
@@ -311,22 +266,16 @@ class AudioCrossAttention(nn.Module):
         """x [B, frames*S, C] noisy tokens; cond [B*frames, M, Ca] audio tokens."""
         B, N, C = x.shape
         S = N // frames
-        xf = x.reshape(B * frames, S, C)
-        BF = xf.shape[0]
-        q = self.q_linear(xf).view(BF, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        q = self.q_norm(q)
-        if x_ref_attn_map is not None:
-            q = self._multi_rope_q(q, x_ref_attn_map, frames, B)
+        BF = B * frames
+        q = self.q_norm(self.q_linear(x.reshape(BF, S, C)).view(BF, S, self.num_heads, self.head_dim))
         M = cond.shape[1]
-        kv = self.kv_linear(cond).view(BF, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv.unbind(0)
+        k, v = self.kv_linear(cond).view(BF, M, 2, self.num_heads, self.head_dim).unbind(2)
         k = self.k_norm(k)
         if x_ref_attn_map is not None:
-            k = self._multi_rope_k(k, x_ref_attn_map, frames, B, human_num)
-        o = _attention(q, k, v)
-        o = o.transpose(1, 2).reshape(BF, S, C)
-        o = self.proj(o)
-        return o.reshape(B, N, C)
+            q = self._multi_rope_q(q.transpose(1, 2), x_ref_attn_map, frames, B).transpose(1, 2)
+            k = self._multi_rope_k(k.transpose(1, 2), x_ref_attn_map, frames, B, human_num).transpose(1, 2)
+        o = _attention(q.reshape(BF, S, C), k.reshape(BF, M, C), v.flatten(2), self.num_heads)
+        return self.proj(o).reshape(B, N, C)
 
     # Multi-person position encoding (official _process_cross_attn with x_ref_attn_map).
     def _multi_rope_q(self, q, x_ref_attn_map, frames, B):
@@ -432,54 +381,62 @@ class AvatarBlock(nn.Module):
         return out.unsqueeze(2).chunk(n, dim=-1)
 
     def _self_attention(self, q, k, v, grid, num_cond, num_ref, ref_img_index, mask_frame_range, cache):
-        """Official Attention.forward split logic. Returns [B, H, N(or noisy), D].
+        """Official Attention.forward split logic on token-major q, k, v [B, N, C]. Returns (noisy, condition) outputs
+        [B, rows, C] (either may be None).
 
         cache: None (no caching), {"store": True} to record condition keys/values, or
         {"k": k_cond, "v": v_cond} to reuse them (q/k/v hold only noisy tokens then).
         """
         T, Hh, Ww = grid
         per = Hh * Ww
+        heads = self.attn.num_heads
         if cache is not None and "k" in cache:
-            k_full = torch.cat([cache["k"], k], dim=2)
-            v_full = torch.cat([cache["v"], v], dim=2)
-            return self._noise_attention(q, k_full, v_full, per, num_cond, num_ref, ref_img_index,
+            k_full = torch.cat([cache["k"], k], dim=1)
+            v_full = torch.cat([cache["v"], v], dim=1)
+            return self._noise_attention(q, k_full, v_full, heads, per, num_cond, num_ref, ref_img_index,
                                          mask_frame_range, T - num_cond), None
         if num_cond == 0:
-            return _attention(q, k, v), None
+            return _attention(q, k, v, heads), None
         nc = num_cond * per
         if num_cond == 1:
-            x_cond = _attention(q[:, :, :nc], k[:, :, :nc], v[:, :, :nc])
+            x_cond = _attention(q[:, :nc], k[:, :nc], v[:, :nc], heads)
         else:
             nr = per  # one reference latent
-            x_ref = _attention(q[:, :, :nr], k[:, :, :nr], v[:, :, :nr])
-            x_prev = _attention(q[:, :, nr:nc], k[:, :, nr:nc], v[:, :, nr:nc])
-            x_cond = torch.cat([x_ref, x_prev], dim=2)
+            x_cond = torch.cat([_attention(q[:, :nr], k[:, :nr], v[:, :nr], heads),
+                                _attention(q[:, nr:nc], k[:, nr:nc], v[:, nr:nc], heads)], dim=1)
         if cache is not None and cache.get("store"):
-            cache["k"], cache["v"] = k[:, :, :nc].contiguous(), v[:, :, :nc].contiguous()
+            # copies: a view would keep the whole step's keys and values alive
+            cache["k"] = k[:, :nc].clone(memory_format=torch.contiguous_format)
+            cache["v"] = v[:, :nc].clone(memory_format=torch.contiguous_format)
             cache.pop("store", None)
         if num_cond == T:
             return None, x_cond
-        x_noise = self._noise_attention(q[:, :, nc:], k, v, per, num_cond, num_ref, ref_img_index,
+        x_noise = self._noise_attention(q[:, nc:], k, v, heads, per, num_cond, num_ref, ref_img_index,
                                         mask_frame_range, T - num_cond)
         return x_noise, x_cond
 
     @staticmethod
-    def _noise_attention(q_noise, k, v, per, num_cond, num_ref, ref_img_index, mask_frame_range, num_noisy):
+    def _noise_attention(q_noise, k, v, heads, per, num_cond, num_ref, ref_img_index, mask_frame_range, num_noisy):
         if num_cond > 1 and mask_frame_range is not None and mask_frame_range > 0 and ref_img_index is not None:
             start = ref_img_index - mask_frame_range - num_cond + num_ref
             end = ref_img_index + mask_frame_range - num_cond + num_ref + 1
             if start >= 0 and end > start and end <= num_noisy:
                 s, e = start * per, end * per
-                k_non_ref, v_non_ref = k[:, :, per:], v[:, :, per:]
-                front = _attention(q_noise[:, :, :s], k, v) if s > 0 else None
-                masked = _attention(q_noise[:, :, s:e], k_non_ref, v_non_ref)
-                back = _attention(q_noise[:, :, e:], k, v) if e < q_noise.shape[2] else None
-                return torch.cat([p for p in (front, masked, back) if p is not None], dim=2)
-        return _attention(q_noise, k, v)
+                k_non_ref, v_non_ref = k[:, per:], v[:, per:]
+                front = _attention(q_noise[:, :s], k, v, heads) if s > 0 else None
+                masked = _attention(q_noise[:, s:e], k_non_ref, v_non_ref, heads)
+                back = _attention(q_noise[:, e:], k, v, heads) if e < q_noise.shape[1] else None
+                return torch.cat([p for p in (front, masked, back) if p is not None], dim=1)
+        return _attention(q_noise, k, v, heads)
 
     def forward(self, x, text_kv, t, grid, num_cond, num_ref, audio_tokens, ref_img_index, mask_frame_range,
-                rope, cache=None, ref_maps=None, human_num=None):
-        """x [B, N, C] (N = all tokens, or only noisy tokens when cache holds the condition)."""
+                rope, cache=None, human_num=None):
+        """x [B, N, C] (N = all tokens, or only noisy tokens when cache holds the condition), updated in place.
+
+        Every residual update is per token (text keys/values are shared, each frame's audio tokens belong to that
+        frame), so the frame chunks keep the exact values while the fp32 temporaries stay small at large sizes. The
+        gated residuals add in fp32 and round once (official (x.float() + gate * y.float()).to(dtype)) in place.
+        """
         B, N, C = x.shape
         T, Hh, Ww = grid
         per = Hh * Ww
@@ -487,44 +444,34 @@ class AvatarBlock(nn.Module):
         t_rows = t[:, num_cond:] if cached else t  # [B, T_x, Ct]
         Tx = t_rows.shape[1]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._mod(self.adaLN_modulation[1], t_rows, 6)
-
-        # self attention
-        xm = torch.empty_like(x)
         xv = x.view(B, Tx, per, C)
-        for f0, f1 in _chunks(Tx, max(1, ROW_CHUNK // per)):
-            xm.view(B, Tx, per, C)[:, f0:f1] = _modulate(self.mod_norm_attn, xv[:, f0:f1], shift_msa[:, f0:f1], scale_msa[:, f0:f1])
-        q, k, v = self.attn.qkv_heads(xm)
-        del xm
-        cos, sin, mats = rope
-        if cached:
-            off = num_cond * per
-            q = apply_rope(q, cos[off:], sin[off:], mats[:, :, off:])
-            k = apply_rope(k, cos[off:], sin[off:], mats[:, :, off:])
-        else:
-            q = apply_rope(q, cos, sin, mats)
-            k = apply_rope(k, cos, sin, mats)
-        x_noise, x_cond = self._self_attention(q, k, v, grid, num_cond, num_ref, ref_img_index, mask_frame_range, cache)
-        ref_attn_map = None
-        if ref_maps is not None and x_noise is not None:
-            ref_attn_map = attn_map_with_target(q[:, :, -x_noise.shape[2]:], k, grid, ref_maps)
-        del q, k, v
-        if cached or x_cond is None:
-            attn_out = x_noise  # cached condition, or no condition at all (audio + text)
-        elif x_noise is None:
-            attn_out = x_cond
-        else:
-            attn_out = torch.cat([x_cond, x_noise], dim=2)
-        del x_noise, x_cond
-        attn_out = self.attn.out_proj(attn_out)
-        # Residual updates run in frame chunks, in place: every op below is per token (text keys/values
-        # are shared, each frame's audio tokens belong to that frame), so chunking keeps the exact values
-        # while the fp32 temporaries stay small at large sizes.
-        xv = x.view(B, Tx, per, C)
-        av = attn_out.view(B, Tx, per, C)
         fstep = max(1, ROW_CHUNK // per)
-        for f0, f1 in _chunks(Tx, fstep):
-            xv[:, f0:f1] = gate_res(xv[:, f0:f1], gate_msa[:, f0:f1], av[:, f0:f1])
-        del attn_out, av
+
+        # self attention: modulation, qkv and the fused q/k norm + RoPE, token-major (no layout copies)
+        pe = rope[2][:, num_cond * per:] if cached else rope[2]
+        frames = max(1, 2 * ROW_CHUNK // per)
+        if Tx <= frames:
+            q, k, v = self.attn.qkv_rows(_modulate(self.mod_norm_attn, xv, shift_msa, scale_msa).view(B, N, C), pe)
+        else:
+            heads, head_dim = self.attn.num_heads, self.attn.head_dim
+            q = torch.empty((B, N, heads, head_dim), dtype=x.dtype, device=x.device)
+            k = torch.empty_like(q)
+            v = torch.empty_like(q)
+            for f0, f1 in _chunks(Tx, frames):
+                r0, r1 = f0 * per, f1 * per
+                xm = _modulate(self.mod_norm_attn, xv[:, f0:f1], shift_msa[:, f0:f1], scale_msa[:, f0:f1])
+                q[:, r0:r1], k[:, r0:r1], v[:, r0:r1] = self.attn.qkv_rows(xm.view(B, r1 - r0, C), pe[:, r0:r1])
+                del xm
+        x_noise, x_cond = self._self_attention(q.flatten(2), k.flatten(2), v.flatten(2), grid, num_cond, num_ref,
+                                               ref_img_index, mask_frame_range, cache)
+        del q, k, v
+        f0 = 0
+        for part in (x_cond, x_noise):
+            if part is not None:
+                f1 = f0 + part.shape[1] // per
+                xv[:, f0:f1].addcmul_(self.attn.proj(part).view(B, f1 - f0, per, C), gate_msa[:, f0:f1])
+                f0 = f1
+        del x_noise, x_cond, part
 
         noisy_frames = T - num_cond
         f_off = 0 if cached else num_cond  # first noisy frame inside x
@@ -535,40 +482,23 @@ class AvatarBlock(nn.Module):
             at = audio_tokens.view(B, noisy_frames, M, Ca)
             for f0, f1 in _chunks(noisy_frames, fstep):
                 nf = f1 - f0
-                flat = xv[:, f_off + f0:f_off + f1].reshape(B, nf * per, C)
+                xn = xv[:, f_off + f0:f_off + f1]
+                flat = xn.view(B, nf * per, C)
                 # text cross attention (condition tokens receive nothing)
-                flat = flat + self.cross_attn(self.pre_crs_attn_norm(flat), tk, tv)
+                flat.add_(self.cross_attn(self.pre_crs_attn_norm(flat), tk, tv))
                 # audio cross attention, modulated by the noisy frames' timesteps
                 ao = self.audio_cross_attn(self.pre_video_crs_attn_norm(flat), at[:, f0:f1].reshape(B * nf, M, Ca), nf,
                                            None, human_num)
-                ao = _modulate(self.mod_norm_attn, ao.view(B, nf, per, C), a_shift[:, f0:f1], a_scale[:, f0:f1])
-                xv[:, f_off + f0:f_off + f1] = gate_res(flat.view(B, nf, per, C), a_gate[:, f0:f1], ao)
+                xn.addcmul_(_modulate(self.mod_norm_attn, ao.view(B, nf, per, C), a_shift[:, f0:f1], a_scale[:, f0:f1]),
+                            a_gate[:, f0:f1])
                 del flat, ao
 
         # feed forward
         for f0, f1 in _chunks(Tx, fstep):
             xm = _modulate(self.mod_norm_ffn, xv[:, f0:f1], shift_mlp[:, f0:f1], scale_mlp[:, f0:f1])
-            h = self.ffn(xm.reshape(B, -1, C)).view(B, f1 - f0, per, C)
-            xv[:, f0:f1] = gate_res(xv[:, f0:f1], gate_mlp[:, f0:f1], h)
+            xv[:, f0:f1].addcmul_(self.ffn(xm.view(B, -1, C)).view(B, f1 - f0, per, C), gate_mlp[:, f0:f1])
+            del xm
         return x
-
-
-def attn_map_with_target(q_noise, k, grid, ref_target_masks):
-    """Official get_attn_map_with_target (multi-person); q [B,H,Nq,D], k [B,H,Nk,D]."""
-    T, Hh, Ww = grid
-    per = Hh * Ww
-    ref_k = k[:, :, :per]  # reference image tokens
-    scale = 1.0 / math.sqrt(q_noise.shape[-1])
-    maps = []
-    for mask in ref_target_masks:  # [per]
-        idx = mask > 0
-        total = None
-        for start, end in _chunks(q_noise.shape[2], 8192):
-            att = torch.matmul(q_noise[:, :, start:end].float() * scale, ref_k.float().transpose(-1, -2)).softmax(-1)
-            val = att[..., idx].sum(-1).mean(1)[0]  # [chunk]
-            total = val if total is None else torch.cat([total, val])
-        maps.append(total)
-    return torch.stack(maps, dim=0)
 
 
 class LongCatVideoAvatarTransformer(nn.Module):
@@ -687,10 +617,8 @@ class LongCatVideoAvatarTransformer(nn.Module):
 
         use_cache = cond_cache is not None and num_cond > 0
         cached = use_cache and len(cond_cache) > 0 and all("k" in c for c in cond_cache.values())
-        if cached:
-            hidden = self.x_embedder.proj(x[:, :, num_cond:].to(dtype)).flatten(2).transpose(1, 2)
-        else:
-            hidden = self.x_embedder.proj(x.to(dtype)).flatten(2).transpose(1, 2)
+        # token-major [B, N, C]: the blocks update it in place, a transposed view would make every op strided
+        hidden = self.x_embedder.proj((x[:, :, num_cond:] if cached else x).to(dtype)).flatten(2).transpose(1, 2).contiguous()
 
         ref_index = ref_img_index if num_ref else None
         rope = rope_3d_cos_sin(self.hidden_size // self.num_heads, (Nt, Nh, Nw), hidden.device,
@@ -706,11 +634,6 @@ class LongCatVideoAvatarTransformer(nn.Module):
         else:
             at = None
 
-        ref_maps = None
-        if ref_target_masks is not None:
-            m = F.interpolate(ref_target_masks.unsqueeze(0).float(), size=(Nh, Nw), mode="nearest").squeeze(0)
-            ref_maps = (m > 0).reshape(m.shape[0], -1).to(dtype)
-
         for i, block in enumerate(self.blocks):
             if text_kv_cache is not None and i in text_kv_cache:
                 tkv = text_kv_cache[i]
@@ -722,7 +645,7 @@ class LongCatVideoAvatarTransformer(nn.Module):
             if use_cache:
                 cache = cond_cache.setdefault(i, {"store": True})
             hidden = block(hidden, tkv, t, (Nt, Nh, Nw), num_cond, num_ref, at, ref_img_index, mask_frame_range,
-                           rope, cache=cache, ref_maps=ref_maps, human_num=human_num)
+                           rope, cache=cache, human_num=human_num)
 
         # final layer (fp32)
         t_rows = t[:, num_cond:] if cached else t
